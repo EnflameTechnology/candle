@@ -4475,6 +4475,94 @@ extern "C" __global__ void quantize_q4_k(const float* __restrict__ x, void* __re
     }
 }
 
+// CUDA kernel for quantizing a matrix of floats to the Q8_0 format.
+//
+// @author
+//   Guoqing Bao
+//  Part of the project: https://github.com/guoqingbao/vllm.rs/
+// Parameters:
+//   x:          Source matrix of f32 values. Assumed to be in contiguous row-major layout.
+//   y:          Destination buffer for the quantized q8_0 blocks.
+//   k:          The number of elements (columns) in a single row of the source matrix.
+//   kx_padded:  The padded row size, which must be a multiple of QK8_0.
+extern "C" __global__ void quantize_q8_0(
+    const float * __restrict__ x,
+    void * __restrict__ y,
+    const int k,
+    const int kx_padded
+) {
+    // blockIdx.x corresponds to the block index within the row.
+    // blockIdx.y corresponds to the row index.
+    // threadIdx.x corresponds to the thread index within the data block (0-31).
+    const int block_idx = blockIdx.x;
+    const int row_idx   = blockIdx.y;
+    const int tid       = threadIdx.x;
+
+    // --- Source Pointer Calculation ---
+    // This calculation assumes the source tensor 'x' is a contiguous row-major matrix.
+    // The offset to the start of the current row is (row_idx * k).
+    // The offset to the start of the current block within that row is (block_idx * QK8_0).
+    const float * const x_block_start = x + (size_t)row_idx * k + (size_t)block_idx * QK8_0;
+
+    // --- Destination Pointer Calculation ---
+    // The destination buffer has a different stride based on the padded row size.
+    // The size of one quantized row in bytes is the number of blocks per padded row
+    // multiplied by the size of a single q8_0 block.
+    const size_t dst_row_size_bytes = (size_t)(kx_padded / QK8_0) * sizeof(block_q8_0);
+    block_q8_0 * const y_block = (block_q8_0 *)((uint8_t*)y + (size_t)row_idx * dst_row_size_bytes) + block_idx;
+
+    // Determine the global element index this thread is responsible for within the original row.
+    const int current_idx_in_row = block_idx * QK8_0 + tid;
+
+    // Find the absolute maximum value (amax) in the block ---
+
+    // Statically allocated shared memory for the parallel reduction.
+    __shared__ float sdata[QK8_0];
+
+    // Each thread loads one float into shared memory.
+    // If the index is outside the original row size 'k', it's padding; load 0.
+    if (current_idx_in_row < k) {
+        sdata[tid] = fabsf(x_block_start[tid]);
+    } else {
+        sdata[tid] = 0.0f; // Padding threads must participate with a neutral value.
+    }
+    __syncthreads();
+
+    // Perform parallel reduction in shared memory to find the max value.
+    for (int s = QK8_0 / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+        }
+        __syncthreads();
+    }
+
+    // Calculate and store the scaling factor 'd' ---
+
+    // Use shared memory to hold the final scale 'd' to ensure visibility for all threads.
+    __shared__ float d_shared;
+    if (tid == 0) {
+        const float amax = sdata[0];
+        // This logic now matches the CPU implementation exactly.
+        // If amax is 0, d will be 0. Otherwise, d = amax / 127.0.
+        d_shared = amax / 127.0f;
+        y_block->d = __float2half(d_shared);
+    }
+    __syncthreads(); // Ensure d_shared is written before other threads read it.
+
+    // Quantize and store the 8-bit values ---
+
+    // Calculate the inverse scale. If d is 0, iscale will be 0.
+    const float iscale = (d_shared != 0.0f) ? 1.0f / d_shared : 0.0f;
+
+    // Each thread quantizes one value. Handle padding.
+    if (current_idx_in_row < k) {
+        const float val = x_block_start[tid];
+        y_block->qs[tid] = roundf(val * iscale);
+    } else {
+        y_block->qs[tid] = 0; // Write 0 for padded elements.
+    }
+}
+
 
 
 /**
@@ -4538,7 +4626,7 @@ __device__ void indexed_moe_forward(
     // Calculate strides
     const size_t weight_block_size = sizeof(block_q_t);
     const size_t input_block_size = sizeof(block_q8_1);
-    const size_t weight_expert_stride_bytes = (size_t)(n * k) / QK_K * weight_block_size;
+    const size_t weight_expert_stride_bytes = (size_t)(n * k) / qk * weight_block_size;
     const size_t input_task_stride_bytes = (size_t)k_padded / QK8_1 * input_block_size;
     const size_t output_task_stride_elems = n;
 
