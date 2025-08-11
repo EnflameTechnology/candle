@@ -2426,22 +2426,16 @@ pub fn dequant_4bit(
 }
 
 #[cfg(feature = "gcu")]
-pub fn expert_mask(
-    input: &Tensor,
-    v: u32,
-) -> Result<Tensor> {
+pub fn expert_mask(input: &Tensor, v: u32) -> Result<Tensor> {
     use candle::gcu_backend::ubridge::device_ptr::DevicePtr;
     use candle::gcu_backend::ubridge::ffi::{mask_f32, mask_i32, mask_u32};
     use candle::gcu_backend::WrapErr;
-    use std::ffi::c_void;
     use candle::Storage;
     use half::{bf16, f16};
+    use std::ffi::c_void;
     let dev = input.device().as_gcu_device()?;
     let (v_input, input_l) = input.storage_and_layout();
-    assert!(
-        input_l.dims().len() == 2,
-        "Invalid input dims!"
-    );
+    assert!(input_l.dims().len() == 2, "Invalid input dims!");
     let (batch, dim_size) = input.dims2()?;
 
     let stream = dev.stream_inner().unwrap();

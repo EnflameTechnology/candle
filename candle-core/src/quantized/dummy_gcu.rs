@@ -48,6 +48,17 @@ impl QGcuStorage {
     ) -> Result<(GcuStorage, crate::Shape)> {
         Err(Error::NotCompiledWithGcuSupport)
     }
+
+    pub fn indexed_moe_forward(
+        &self,
+        _: &crate::Shape,
+        _: &GcuStorage,
+        _: &crate::Layout,
+        _: &GcuStorage,
+        _: &crate::Layout,
+    ) -> Result<(GcuStorage, crate::Shape)> {
+        Err(Error::NotCompiledWithGcuSupport)
+    }
 }
 
 pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
