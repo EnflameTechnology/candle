@@ -27,3 +27,4 @@ candle-nn = { path = "../candle-nn", features = ["cuda"] }
 
 [features]
 flash-decoding = []
+flash-context = []
