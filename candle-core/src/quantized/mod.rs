@@ -332,7 +332,11 @@ impl QTensor {
         let shape = src.shape();
         let block_size = dtype.block_size();
         check_shape(shape, block_size)?;
-        let src = src.to_dtype(crate::DType::F32)?.flatten_all()?;
+        let src = if src.dtype() != crate::DType::F32 {
+            src.to_dtype(crate::DType::F32)?.flatten_all()?
+        } else {
+            src.flatten_all()?
+        };
         let elem_count = shape.elem_count();
         if elem_count % block_size != 0 {
             crate::bail!(
