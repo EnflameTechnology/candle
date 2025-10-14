@@ -1056,7 +1056,7 @@ pub fn apply_rotary_emb_qkv(
     key: &Tensor,
     cos_sin: &Tensor,
     _: &Tensor,
-    index_positions: &Vec<i32>,
+    index_positions: &Tensor,
     split_dim: usize,
     query_key_transposed: bool,
     gpt_neox: bool,
@@ -1067,8 +1067,7 @@ pub fn apply_rotary_emb_qkv(
         cos_sin: &Tensor,
         cos_sin_length: i32,
         cos_sin_stride: i32,
-        index_positions: &Vec<i32>,
-        batch: i32,
+        index_positions: &Tensor,
         num_tokens: i32,
         q_head_size: i32,
         k_head_size: i32,
@@ -1081,7 +1080,6 @@ pub fn apply_rotary_emb_qkv(
             cos_sin_length,
             cos_sin_stride,
             index_positions: index_positions.clone(),
-            batch,
             num_tokens,
             q_head_size,
             k_head_size,
@@ -1105,8 +1103,7 @@ pub fn apply_rotary_emb_qkv(
             cos_sin_length as i32,
             cos_sin_stride as i32,
             index_positions,
-            b_sz as i32,
-            seq_len as i32,
+            (b_sz * seq_len) as i32,
             q_head_size as i32,
             k_head_size as i32,
             hidden_size as i32,
@@ -1126,8 +1123,7 @@ pub fn apply_rotary_emb_qkv(
             cos_sin_length as i32,
             cos_sin_stride as i32,
             index_positions,
-            b_sz as i32,
-            seq_len as i32,
+            (b_sz * seq_len) as i32,
             q_head_size as i32,
             k_head_size as i32,
             hidden_size as i32,
@@ -1144,7 +1140,7 @@ pub fn apply_rotary_emb_qkv(
     k: &Tensor,
     cos: &Tensor,
     sin: &Tensor,
-    index_pos: usize,
+    index_pos: &usize,
     split_dim: usize,
     query_key_transposed: bool,
     gpt_neox: bool,
@@ -1160,8 +1156,8 @@ pub fn apply_rotary_emb_qkv(
         Tensor::cat(&[&xs2.neg()?, &xs1], D::Minus1)
     }
     let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
-    let cos = cos.narrow(0, index_pos, seq_len)?;
-    let sin = sin.narrow(0, index_pos, seq_len)?;
+    let cos = cos.narrow(0, *index_pos, seq_len)?;
+    let sin = sin.narrow(0, *index_pos, seq_len)?;
     let cos = cos.unsqueeze(0)?.unsqueeze(0)?; // (1, 1, seq_len, dim)
     let sin = sin.unsqueeze(0)?.unsqueeze(0)?; // (1, 1, seq_len, dim)
     let q_embed = (q.broadcast_mul(&cos)? + rotate_half(q)?.broadcast_mul(&sin))?;
@@ -1191,7 +1187,7 @@ pub fn partial_rotary_emb_qkv(
         &key_rot,
         &cos_sin,
         &sin,
-        index_pos,
+        &index_pos,
         0,
         query_key_transposed,
         true,
@@ -1222,7 +1218,7 @@ pub fn kvconcat(ltensor: &Tensor, rtensor: &Tensor, concat_dim: i32) -> Result<T
 
 #[cfg(not(feature = "gcu"))]
 pub fn kvconcat(ltensor: &Tensor, rtensor: &Tensor, concat_dim: i32) -> Result<Tensor> {
-    Tensor::cat(&[ltensor, &rtensor], concat_dim as usize)?.contiguous()
+    Tensor::cat(&[ltensor, &rtensor], concat_dim as usize)?
 }
 
 #[cfg(feature = "gcu")]
@@ -1807,7 +1803,7 @@ fn update_cache<
     let v = v.as_gcu_slice::<T>()?;
     let kc = kc.as_gcu_slice::<T>()?;
     let vc = vc.as_gcu_slice::<T>()?;
-    let s = s.as_gcu_slice::<i32>()?;
+    let s = s.as_gcu_slice::<i64>()?;
 
     // Get cuda views for all tensors
     let k = k.slice(k_l.start_offset()..);
@@ -2496,7 +2492,6 @@ pub fn expert_mask(input: &Tensor, v: u32) -> Result<Tensor> {
     )?)
 }
 
-
 //input: [batch, M (topk or 1), k]
 //weight: [num_experts, n, k]
 //indices: [batch, topk]
@@ -2527,21 +2522,23 @@ fn indexed_moe_func<
     let (indices_value, indices_l) = indices.storage_and_layout();
 
     assert!(
-        input.dims().len() == 3
-            && weight.dims().len() == 3
-            && indices.dims().len() == 2,
+        input.dims().len() == 3 && weight.dims().len() == 3 && indices.dims().len() == 2,
         "Invalid input dims!"
     );
     let (b1, topk) = indices.dims2()?;
     let (batch, m, k) = input.dims3()?;
     let (num_experts, n, k1) = weight.dims3()?;
-    let tile_size = if batch > 12 {
-        128
-    } else {
-        64
-    };
-    assert!(k % tile_size ==0, "indexed_moe: k dim must be aligned to {}!", tile_size);
-    assert!(n % tile_size ==0, "indexed_moe: n dim must be aligned to {}!", tile_size);
+    let tile_size = if batch > 12 { 128 } else { 64 };
+    assert!(
+        k % tile_size == 0,
+        "indexed_moe: k dim must be aligned to {}!",
+        tile_size
+    );
+    assert!(
+        n % tile_size == 0,
+        "indexed_moe: n dim must be aligned to {}!",
+        tile_size
+    );
 
     // let (b2, _, n1) = out_l.dims3()?;
 
@@ -2583,7 +2580,6 @@ fn indexed_moe_func<
     };
     let indices_value = indices_value.as_gcu_slice::<u32>()?;
     let indices_value = indices_value.slice(indices_l.start_offset()..);
-
 
     match input.dtype() {
         DType::F16 => unsafe {

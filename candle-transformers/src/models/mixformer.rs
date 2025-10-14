@@ -279,29 +279,28 @@ impl MHA {
         seqlen_offset: usize,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let (b_sz, _, _, _, _) = qkv.dims5()?;
-        if qkv.device().is_gcu() {
+        #[cfg(feature = "gcu")]
+        {
             let q = qkv.i((.., .., 0))?;
             let k = qkv.i((.., .., 1))?;
             let v = qkv.i((.., .., 2))?;
             let (_, rotary_dim) = self.rotary_emb.cos.dims2()?;
             let rotary_dim = rotary_dim * 2;
-            let mut input_positions = Vec::<i32>::new();
-            for _ in 0..b_sz {
-                input_positions.push(seqlen_offset as i32);
-            }
-            #[cfg(feature = "gcu")]
+            let seqlen_offset = Tensor::new(seqlen_offset as i64, &q.device())?;
+
             let (q, k) = candle_nn::apply_rotary_emb_qkv(
                 &q,
                 &k,
                 &self.rotary_emb.cos_sin,
                 &self.rotary_emb.sin,
-                &input_positions,
+                &seqlen_offset,
                 rotary_dim,
                 false,
                 true,
             )?;
             Ok((q, k, v))
-        } else {
+        } 
+        #[cfg(not(feature = "gcu"))] {
             self.rotary_emb.apply_rotary_emb_qkv(qkv, seqlen_offset)
         }
     }

@@ -67,10 +67,10 @@ impl Tensor {
         } else {
             let args: Vec<Tensor> = args
                 .iter()
-                .map(|a| a.as_ref().transpose(0, dim))
+                .map(|a| a.as_ref().transpose(0, dim)?.contiguous())
                 .collect::<Result<Vec<_>>>()?;
             let cat = Self::cat0(&args)?;
-            cat.transpose(0, dim)
+            cat.transpose(0, dim)?.contiguous()
         }
     }
 
