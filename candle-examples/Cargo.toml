@@ -38,7 +38,7 @@ tokenizers = { workspace = true, features = ["onig"] }
 float_eq = "1"
 cpal = { version = "0.15.2", optional = true }
 pdf2image = { version = "0.1.2" , optional = true}
-ubridge = { path = "../../ubridge", version = "0.1.0", optional=true}
+ubridge = { git = "https://github.com/EnflameTechnology/Ubridge.git", version = "0.1.0", optional=true, rev = "c6423ab"}
 
 [dev-dependencies]
 anyhow = { workspace = true }
