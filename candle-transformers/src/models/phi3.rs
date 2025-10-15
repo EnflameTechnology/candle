@@ -69,7 +69,7 @@ impl RotaryEmbedding {
             .to_dtype(dtype)?
             .reshape((max_seq_len, 1))?;
         let freqs = t.matmul(&inv_freq)?;
-        let cos_sin = Tensor::cat(&[&freqs.cos()?, &freqs.sin()?], D::Minus1)?.contiguous()?; //must be contiguous tensor;
+        let cos_sin = Tensor::cat(&[&freqs.cos()?, &freqs.sin()?], D::Minus1)?; //must be contiguous tensor;
         Ok(Self {
             sin: freqs.sin()?,
             cos: freqs.cos()?,
@@ -84,28 +84,19 @@ impl RotaryEmbedding {
         seqlen_offset: usize,
     ) -> Result<(Tensor, Tensor)> {
         let (b_sz, _h, seq_len, _n_embd) = q.dims4()?;
-        if q.device().is_gcu() {
-            let mut input_positions = Vec::<i32>::new();
-            for _ in 0..b_sz {
-                input_positions.push(seqlen_offset as i32);
-            }
-            candle_nn::apply_rotary_emb_qkv(
-                q,
-                k,
-                &self.cos_sin,
-                &self.sin,
-                &input_positions,
-                0,
-                true,
-                true,
-            )
-        } else {
-            let cos = self.cos.narrow(0, seqlen_offset, seq_len)?;
-            let sin = self.sin.narrow(0, seqlen_offset, seq_len)?;
-            let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
-            let k_embed = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
-            Ok((q_embed, k_embed))
-        }
+        #[cfg(feature = "gcu")]
+        let seqlen_offset = Tensor::new(seqlen_offset as i64, &q.device())?;
+
+        candle_nn::apply_rotary_emb_qkv(
+            q,
+            k,
+            &self.cos_sin,
+            &self.sin,
+            &seqlen_offset,
+            0,
+            true,
+            true,
+        )
     }
 }
 

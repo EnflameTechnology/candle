@@ -76,7 +76,7 @@ impl RotaryEmbedding {
             .to_dtype(dtype)?
             .reshape((cfg.seq_length, 1))?;
         let freqs = t.matmul(&inv_freq)?;
-        let cos_sin = Tensor::cat(&[&freqs.cos()?, &freqs.sin()?], D::Minus1)?.contiguous()?; //must be contiguous tensor;
+        let cos_sin = Tensor::cat(&[&freqs.cos()?, &freqs.sin()?], D::Minus1)?; //must be contiguous tensor;
         let cache = Tensor::stack(&[&freqs.cos()?, &freqs.sin()?], D::Minus1)?;
         Ok(Self { cache, cos_sin })
     }
@@ -294,15 +294,14 @@ impl SelfAttention {
         // let key_layer = rotary_emb.apply(&key_layer, seqlen_offset)?;
 
         let rot_dim = rotary_emb.cache.dim(D::Minus2)? * 2;
-        let mut input_positions = Vec::<i32>::new();
-        input_positions.push(seqlen_offset as i32);
         #[cfg(feature = "gcu")]
+        let seqlen_offset = Tensor::new(seqlen_offset as i64, &xs.device())?;
         let (query_layer, key_layer) = candle_nn::ops::apply_rotary_emb_qkv(
             &query_layer,
             &key_layer,
             &rotary_emb.cos_sin,
             &rotary_emb.cache,
-            &input_positions,
+            &seqlen_offset,
             rot_dim,
             false,
             false,

@@ -71,7 +71,7 @@ impl RotaryEmbedding {
             .to_dtype(dtype)?
             .reshape((cfg.max_position_embeddings, 1))?;
         let freqs = t.matmul(&inv_freq)?;
-        let cos_sin = Tensor::cat(&[&freqs.cos()?, &freqs.sin()?], D::Minus1)?.contiguous()?; //must be contiguous tensor;
+        let cos_sin = Tensor::cat(&[&freqs.cos()?, &freqs.sin()?], D::Minus1)?; //must be contiguous tensor;
         let emb = Tensor::cat(&[&freqs, &freqs], D::Minus1)?;
         Ok(Self {
             dim,
@@ -243,8 +243,8 @@ impl Attention {
             true,
         )?;
 
-        let mut input_positions = Vec::<i32>::new();
-        input_positions.push(seqlen_offset as i32);
+        #[cfg(feature = "gcu")]
+        let seqlen_offset = Tensor::new(seqlen_offset as i64, &query_states.device())?;
 
         #[cfg(feature = "gcu")]
         let (query_states, key_states) = candle_nn::apply_rotary_emb_qkv(
@@ -252,7 +252,7 @@ impl Attention {
             &key_states,
             &self.rotary_emb.cos_sin,
             &self.rotary_emb.sin,
-            &input_positions,
+            &seqlen_offset,
             self.rotary_emb.dim,
             true,
             true,

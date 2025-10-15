@@ -186,8 +186,9 @@ impl Attention {
                 .transpose(1, 2)?;
             (q, k, v.contiguous()?)
         };
-        let mut input_positions = Vec::<i32>::new();
-        input_positions.push(seqlen_offset as i32);
+        #[cfg(feature = "gcu")]
+        let seqlen_offset = Tensor::new(seqlen_offset as i64, &xs.device())?;
+
         let (query_states, key_states) = candle_nn::apply_rotary_emb_qkv(
             &query_states,
             &key_states,
@@ -197,7 +198,7 @@ impl Attention {
                 &self.rotary_emb.cos
             },
             &self.rotary_emb.sin,
-            &input_positions,
+            &seqlen_offset,
             0,
             true,
             true,

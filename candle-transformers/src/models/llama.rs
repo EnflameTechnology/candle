@@ -203,8 +203,7 @@ impl Cache {
             .matmul(&theta.reshape((1, theta.elem_count()))?)?;
         // This is different from the paper, see:
         // https://github.com/huggingface/transformers/blob/6112b1c6442aaf7affd2b0676a1cd4eee30c45cf/src/transformers/models/llama/modeling_llama.py#L112
-        let cos_sin =
-            Tensor::cat(&[&idx_theta.cos()?, &idx_theta.sin()?], D::Minus1)?.contiguous()?; //must be contiguous tensor;
+        let cos_sin = Tensor::cat(&[&idx_theta.cos()?, &idx_theta.sin()?], D::Minus1)?; //must be contiguous tensor;
         let idx_theta = Tensor::cat(&[&idx_theta, &idx_theta], D::Minus1)?;
         let cos = idx_theta.cos()?.to_dtype(dtype)?;
         let sin = idx_theta.sin()?.to_dtype(dtype)?;
@@ -293,10 +292,9 @@ impl CausalSelfAttention {
                 .transpose(1, 2)?;
             (q, k, v.contiguous()?)
         };
-        let mut input_positions = Vec::<i32>::new();
-        for _ in 0..b_sz {
-            input_positions.push(index_pos as i32);
-        }
+
+        #[cfg(feature = "gcu")]
+        let index_pos = Tensor::new(index_pos as i64, &q.device())?;
         let (q, mut k) = candle_nn::apply_rotary_emb_qkv(
             &q,
             &k,
@@ -306,7 +304,7 @@ impl CausalSelfAttention {
                 &cache.cos
             },
             &cache.sin,
-            &input_positions,
+            &index_pos,
             0,
             true,
             true,

@@ -2689,8 +2689,7 @@ impl BackendStorage for GcuStorage {
 pub struct Rope {
     pub cos_sin_length: i32,
     pub cos_sin_stride: i32,
-    pub index_positions: Vec<i32>,
-    pub batch: i32,
+    pub index_positions: crate::Tensor,
     pub num_tokens: i32,
     pub q_head_size: i32,
     pub k_head_size: i32,
@@ -2737,10 +2736,18 @@ impl crate::CustomOp3 for Rope {
         };
         let shape = query_l.shape();
 
-        let positions = dev.htod_copy(self.index_positions.to_vec()).w()?;
+        let (positions, positions_l) = self.index_positions.storage_and_layout();
+        let positions = match &*positions {
+            crate::Storage::Gcu(p) => p,
+            _ => panic!("positions must be a gcu tensor"),
+        };
 
-        match (&query.slice, &key.slice) {
-            (GcuStorageSlice::BF16(query_), GcuStorageSlice::BF16(key_)) => {
+        match (&query.slice, &key.slice, &positions.slice) {
+            (
+                GcuStorageSlice::BF16(query_),
+                GcuStorageSlice::BF16(key_),
+                GcuStorageSlice::I64(positions_),
+            ) => {
                 let (func, cos_sin_ptr) = match &cos_sin.slice {
                     GcuStorageSlice::BF16(cos_sin_) => (
                         dev.get_or_load_func("rope_bf16", ubridge::EMBEDDING)?,
@@ -2758,8 +2765,7 @@ impl crate::CustomOp3 for Rope {
                     cos_sin_ptr,
                     self.cos_sin_length,
                     self.cos_sin_stride,
-                    positions.device_ptr(),
-                    self.batch,
+                    positions_.device_ptr(),
                     self.num_tokens,
                     self.q_head_size,
                     self.k_head_size,
@@ -2769,7 +2775,11 @@ impl crate::CustomOp3 for Rope {
                 );
                 unsafe { func.launch(cfg, params) }.w()?;
             }
-            (GcuStorageSlice::F32(query_), GcuStorageSlice::F32(key_)) => {
+            (
+                GcuStorageSlice::F32(query_),
+                GcuStorageSlice::F32(key_),
+                GcuStorageSlice::I64(positions_),
+            ) => {
                 let (func, cos_sin_ptr) = match &cos_sin.slice {
                     GcuStorageSlice::F32(cos_sin_) => (
                         dev.get_or_load_func("rope_f32", ubridge::EMBEDDING)?,
@@ -2783,8 +2793,7 @@ impl crate::CustomOp3 for Rope {
                     cos_sin_ptr,
                     self.cos_sin_length,
                     self.cos_sin_stride,
-                    positions.device_ptr(),
-                    self.batch,
+                    positions_.device_ptr(),
                     self.num_tokens,
                     self.q_head_size,
                     self.k_head_size,
@@ -2794,7 +2803,11 @@ impl crate::CustomOp3 for Rope {
                 );
                 unsafe { func.launch(cfg, params) }.w()?;
             }
-            (GcuStorageSlice::F16(query_), GcuStorageSlice::F16(key_)) => {
+            (
+                GcuStorageSlice::F16(query_),
+                GcuStorageSlice::F16(key_),
+                GcuStorageSlice::I64(positions_),
+            ) => {
                 let (func, cos_sin_ptr) = match &cos_sin.slice {
                     GcuStorageSlice::F16(cos_sin_) => (
                         dev.get_or_load_func("rope_f16", ubridge::EMBEDDING)?,
@@ -2812,8 +2825,7 @@ impl crate::CustomOp3 for Rope {
                     cos_sin_ptr,
                     self.cos_sin_length,
                     self.cos_sin_stride,
-                    positions.device_ptr(),
-                    self.batch,
+                    positions_.device_ptr(),
                     self.num_tokens,
                     self.q_head_size,
                     self.k_head_size,
