@@ -25,7 +25,7 @@ impl OffloadBuffer {
         let size = std::mem::size_of::<T>() * src.len();
         let mut ptr_host = std::ptr::null_mut();
         unsafe {
-            driv::topsHostMalloc(&mut ptr_host as *mut *mut core::ffi::c_void, size as u64, 0);
+            driv::topsHostMalloc(&mut ptr_host as *mut *mut core::ffi::c_void, size, 0);
             std::ptr::copy(src.as_ptr() as *mut core::ffi::c_void, ptr_host, size);
         }
         Ok(OffloadBuffer {

@@ -299,8 +299,9 @@ impl MHA {
                 true,
             )?;
             Ok((q, k, v))
-        } 
-        #[cfg(not(feature = "gcu"))] {
+        }
+        #[cfg(not(feature = "gcu"))]
+        {
             self.rotary_emb.apply_rotary_emb_qkv(qkv, seqlen_offset)
         }
     }
