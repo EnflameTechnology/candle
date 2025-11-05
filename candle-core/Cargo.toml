@@ -34,7 +34,7 @@ ug-metal = { workspace = true, optional = true }
 yoke = { workspace = true }
 zip = { workspace = true }
 
-ubridge = { git = "https://github.com/EnflameTechnology/Ubridge.git", version = "0.1.0", optional=true, rev = "bfa484a"}
+ubridge = { git = "https://github.com/EnflameTechnology/Ubridge.git", version = "0.1.0", optional=true, rev = "db20fe2"}
 uhal = { git = "https://github.com/EnflameTechnology/UHHI.git", version = "0.1.0", optional=true, rev = "0980208"}
 cust_core = { git = "https://github.com/EnflameTechnology/UHHI.git", version = "0.1.0", optional=true, rev = "0980208"}
 
