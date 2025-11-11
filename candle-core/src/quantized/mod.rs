@@ -128,6 +128,15 @@ impl QStorage {
             }
         }
     }
+
+    pub fn device_ptr(&self) -> Result<*const u8> {
+        match self {
+            QStorage::Cuda(storage) => storage.device_ptr(),
+            QStorage::Metal(_) | QStorage::Cpu(_) => {
+                crate::bail!("not implemented");
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -425,6 +434,15 @@ impl QTensor {
 
     pub fn data(&self) -> Result<Cow<'_, [u8]>> {
         self.storage.data()
+    }
+
+    pub fn device_ptr(&self) -> Result<*const u8> {
+        match &self.storage {
+            QStorage::Cuda(storage) => storage.device_ptr(),
+            QStorage::Metal(_) | QStorage::Cpu(_) => {
+                crate::bail!("not implemented");
+            }
+        }
     }
 }
 
