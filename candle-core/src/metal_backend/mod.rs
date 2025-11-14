@@ -1965,6 +1965,10 @@ impl BackendDevice for MetalDevice {
         ))
     }
 
+    fn empty_impl(&self, shape: &Shape, dtype: DType, _sync_alloc: bool) -> Result<MetalStorage> {
+        self.zeros_impl(shape, dtype)
+    }
+
     fn ones_impl(&self, shape: &Shape, dtype: DType) -> Result<MetalStorage> {
         let name = match dtype {
             DType::U8 => "fill_u8",

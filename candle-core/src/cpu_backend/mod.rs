@@ -2647,6 +2647,10 @@ impl BackendDevice for CpuDevice {
         Ok(storage)
     }
 
+    fn empty_impl(&self, shape: &Shape, dtype: DType, _sync_alloc: bool) -> Result<CpuStorage> {
+        self.zeros_impl(shape, dtype)
+    }
+
     fn synchronize(&self) -> Result<()> {
         Ok(())
     }
