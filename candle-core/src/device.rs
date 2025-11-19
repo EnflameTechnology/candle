@@ -309,35 +309,18 @@ impl Device {
         }
     }
 
-    pub(crate) fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Storage> {
+    pub(crate) fn zeros(&self, shape: &Shape, dtype: DType, sync_alloc: bool) -> Result<Storage> {
         match self {
             Device::Cpu => {
-                let storage = CpuDevice.zeros_impl(shape, dtype)?;
+                let storage = CpuDevice.zeros_impl(shape, dtype, sync_alloc)?;
                 Ok(Storage::Cpu(storage))
             }
             Device::Cuda(device) => {
-                let storage = device.zeros_impl(shape, dtype)?;
+                let storage = device.zeros_impl(shape, dtype, sync_alloc)?;
                 Ok(Storage::Cuda(storage))
             }
             Device::Metal(device) => {
-                let storage = device.zeros_impl(shape, dtype)?;
-                Ok(Storage::Metal(storage))
-            }
-        }
-    }
-
-    pub(crate) fn empty(&self, shape: &Shape, dtype: DType, sync_alloc: bool) -> Result<Storage> {
-        match self {
-            Device::Cpu => {
-                let storage = CpuDevice.empty_impl(shape, dtype, sync_alloc)?;
-                Ok(Storage::Cpu(storage))
-            }
-            Device::Cuda(device) => {
-                let storage = device.empty_impl(shape, dtype, sync_alloc)?;
-                Ok(Storage::Cuda(storage))
-            }
-            Device::Metal(device) => {
-                let storage = device.empty_impl(shape, dtype, sync_alloc)?;
+                let storage = device.zeros_impl(shape, dtype, sync_alloc)?;
                 Ok(Storage::Metal(storage))
             }
         }
