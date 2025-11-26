@@ -2736,7 +2736,7 @@ impl crate::CustomOp3 for Rope {
         };
         let shape = query_l.shape();
 
-        let (positions, positions_l) = self.index_positions.storage_and_layout();
+        let (positions, _) = self.index_positions.storage_and_layout();
         let positions = match &*positions {
             crate::Storage::Gcu(p) => p,
             _ => panic!("positions must be a gcu tensor"),

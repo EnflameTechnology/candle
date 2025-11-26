@@ -1549,6 +1549,70 @@ impl Tensor {
         }
     }
 
+    /// copy src data to current tensor
+    pub fn copy_(&self, src: &Self, dst_offset: usize) -> Result<()> {
+        if self.dtype() != src.dtype() {
+            Err(Error::DTypeMismatchBinaryOp {
+                lhs: self.dtype(),
+                rhs: src.dtype(),
+                op: "copy_",
+            }
+            .bt())?
+        }
+
+        if self.elem_count() < src.elem_count() {
+            Err(Error::Msg {
+                0: "Dst tensor size must not smaller than the src Tensor.".to_string(),
+            }
+            .bt())?
+        }
+
+        let mut storage = self.storage_mut();
+        src.storage()
+            .copy_strided_src(&mut storage, dst_offset, self.layout())
+    }
+
+    /// clear current tensor data to all zeros
+    pub fn zero_(&self) -> Result<()> {
+        #[cfg(not(feature = "gcu"))]
+        crate::bail!("Not supported platform!");
+
+        #[cfg(feature = "gcu")]
+        let dev = self.device().as_gcu_device()?;
+        #[cfg(feature = "gcu")]
+        match *self.storage_mut() {
+            Storage::Gcu(ref mut storage) => {
+                use crate::gcu_backend::GcuStorageSlice;
+                match &mut storage.slice {
+                    GcuStorageSlice::U32(dst) => {
+                        let mut dst = dst.slice_mut(..);
+                        dev.memset_zeros(&mut dst).map_err(crate::Error::wrap)
+                    }
+                    GcuStorageSlice::I64(dst) => {
+                        let mut dst = dst.slice_mut(..);
+                        dev.memset_zeros(&mut dst).map_err(crate::Error::wrap)
+                    }
+                    GcuStorageSlice::F32(dst) => {
+                        let mut dst = dst.slice_mut(..);
+                        dev.memset_zeros(&mut dst).map_err(crate::Error::wrap)
+                    }
+                    GcuStorageSlice::F16(dst) => {
+                        let mut dst = dst.slice_mut(..);
+                        dev.memset_zeros(&mut dst).map_err(crate::Error::wrap)
+                    }
+                    GcuStorageSlice::BF16(dst) => {
+                        let mut dst = dst.slice_mut(..);
+                        dev.memset_zeros(&mut dst).map_err(crate::Error::wrap)
+                    }
+                    _ => crate::bail!("Not supported dtype!"),
+                }
+            }
+            _ => {
+                crate::bail!("Not supported platform!")
+            }
+        }
+    }
+
     /// Embeds the values of the `src` tensor into the `self` tensor on the first dimension.
     pub fn slice_scatter0(&self, src: &Self, start: usize) -> Result<Self> {
         if self.dtype() != src.dtype() {
