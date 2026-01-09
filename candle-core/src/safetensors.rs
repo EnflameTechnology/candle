@@ -42,6 +42,7 @@ impl TryFrom<st::Dtype> for DType {
             st::Dtype::F32 => Ok(DType::F32),
             st::Dtype::F64 => Ok(DType::F64),
             st::Dtype::I32 => Ok(DType::U32),
+            st::Dtype::F8_E4M3 => Ok(DType::U8),
             dtype => Err(Error::UnsupportedSafeTensorDtype(dtype)),
         }
     }
@@ -225,6 +226,7 @@ fn convert(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
         st::Dtype::F16 => convert_::<half::f16>(view, device),
         st::Dtype::F32 => convert_::<f32>(view, device),
         st::Dtype::F64 => convert_::<f64>(view, device),
+        st::Dtype::F8_E4M3 => convert_::<u8>(view, device),
         dtype => Err(Error::UnsupportedSafeTensorDtype(dtype)),
     }
 }
