@@ -71,7 +71,6 @@ tracing = "0.1.37"
 tracing-chrome = "0.7.1"
 tracing-subscriber = "0.3.7"
 ug = "0.1.0"
-ug-cuda = "0.1.0"
 ug-metal = "0.1.0"
 yoke = { version = "0.7.2", features = ["derive"] }
 zip = { version = "1.1.1", default-features = false }
