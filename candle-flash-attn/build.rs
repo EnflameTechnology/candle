@@ -99,7 +99,19 @@ fn main() -> Result<()> {
 
     let mut builder = bindgen_cuda::Builder::default()
         .kernel_paths(kernel_files)
-        .out_dir(build_dir.clone())
+        .out_dir(build_dir.clone());
+
+    if let Some(c) = builder.get_compute_cap() {
+        if c > 90 {
+            println!(
+                "cargo:warning=Detected CUDA compute capability {} (> 90). Clamping to sm_90 for flash-attention build.",
+                c
+            );
+            builder.set_compute_cap(90);
+        }
+    };
+
+    builder = builder
         .arg("-O3")
         .arg("-std=c++17")
         .arg("-U__CUDA_NO_HALF_OPERATORS__")

@@ -54,7 +54,7 @@ tokio = "1.43.0"
 
 [build-dependencies]
 anyhow = { workspace = true }
-bindgen_cuda = {git = "https://github.com/guoqingbao/bindgen_cuda.git", version= "0.1.7", optional = true}
+bindgen_cuda = {git = "https://github.com/guoqingbao/bindgen_cuda.git", version= "0.1.7", rev = "c568a81", optional = true}
 
 [features]
 default = []
