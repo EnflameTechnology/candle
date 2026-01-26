@@ -54,12 +54,12 @@ tokio = "1.43.0"
 
 [build-dependencies]
 anyhow = { workspace = true }
-bindgen_cuda = {git = "https://github.com/guoqingbao/bindgen_cuda.git", version= "0.1.7", rev = "c568a81", optional = true}
+cudaforge = { git = "https://github.com/guoqingbao/cudaforge.git", version= "0.1.0", rev = "6b509c1", optional = true}
 
 [features]
 default = []
 accelerate = ["dep:accelerate-src", "candle/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
-cuda = ["candle/cuda", "candle-nn/cuda", "candle-transformers/cuda", "dep:bindgen_cuda"]
+cuda = ["candle/cuda", "candle-nn/cuda", "candle-transformers/cuda", "dep:cudaforge"]
 cudnn = ["candle/cudnn"]
 flash-attn = ["cuda", "candle-transformers/flash-attn", "dep:candle-flash-attn"]
 mkl = ["dep:intel-mkl-src", "candle/mkl", "candle-nn/mkl", "candle-transformers/mkl"]

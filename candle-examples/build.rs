@@ -21,11 +21,13 @@ fn main() -> Result<()> {
     #[cfg(feature = "cuda")]
     {
         for kdir in KERNEL_DIRS.iter() {
-            let builder = bindgen_cuda::Builder::default().kernel_paths_glob(kdir.kernel_glob);
-            println!("cargo:info={builder:?}");
-            let bindings = builder.build_ptx().unwrap();
-            bindings.write(kdir.rust_target).unwrap()
+            let bindings = cudaforge::KernelBuilder::new()
+                .source_glob(kdir.kernel_glob)
+                .build_ptx()?; // ✅ Propagate errors
+
+            bindings.write(kdir.rust_target)?;
         }
     }
+
     Ok(())
 }
