@@ -54,7 +54,7 @@ tokio = "1.43.0"
 
 [build-dependencies]
 anyhow = { workspace = true }
-cudaforge = { git = "https://github.com/guoqingbao/cudaforge.git", version= "0.1.0", rev = "6b509c1", optional = true}
+cudaforge = { git = "https://github.com/guoqingbao/cudaforge.git", version= "0.1.0", rev = "10a9538", optional = true}
 
 [features]
 default = []
