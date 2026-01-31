@@ -103,7 +103,6 @@ fn main() -> Result<()> {
         .arg("-U__CUDA_NO_BFLOAT16_CONVERSIONS__")
         .arg("--expt-relaxed-constexpr")
         .arg("--expt-extended-lambda")
-        .arg("--use_fast_math")
         .arg("--verbose")
         .arg("-Xfatbin")
         .arg("-compress-all")

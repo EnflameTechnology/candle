@@ -8,7 +8,6 @@ fn main() {
 
     let bindings = KernelBuilder::new()
         .source_dir("src") // Scan src/ for .cu files
-        .arg("-O3")
         .build_ptx()
         .expect("Failed to compile CUDA kernels");
 
