@@ -1301,6 +1301,8 @@ struct FlashAttnCache {
     pub block_table: Option<Tensor>,
     pub context_lens: Option<Tensor>,
     pub alibi_slopes: Option<Tensor>,
+    pub window_size_left: Option<usize>,
+    pub window_size_right: Option<usize>,
     pub softcap: Option<f32>,
     pub seqlenq_ngroups_swapped: bool,
     pub q_batch_stride: usize,
@@ -1454,6 +1456,16 @@ impl FlashAttnCache {
 
         let seqlen_k = max_num_blocks_per_seq * block_size;
         let seqlen_k_rounded = round_multiple(seqlen_k, 128);
+        let mut window_size_left = self
+            .window_size_left
+            .filter(|v| v <= &seqlen_k)
+            .map(|v| v as i32)
+            .unwrap_or(-1);
+        let mut window_size_right = self
+            .window_size_right
+            .filter(|v| v <= &seqlen_k)
+            .map(|v| v as i32)
+            .unwrap_or(-1);
 
         let elem_count = out_shape.elem_count();
         let dst = unsafe { dev.alloc::<T>(elem_count) }.w()?;
@@ -1498,6 +1510,19 @@ impl FlashAttnCache {
             o_batch_stride *= seqlen_q as u32;
         }
 
+        // Causal is represented by window_size_left=None and window_size_right=Some(0).
+        let is_causal = if window_size_left < 0 && window_size_right == 0 {
+            1
+        } else {
+            0
+        };
+        if window_size_left < 0 && window_size_right >= 0 {
+            window_size_left = seqlen_k as i32;
+        }
+        if window_size_left >= 0 && window_size_right < 0 {
+            window_size_right = seqlen_k as i32;
+        }
+
         unsafe {
             let q_ptr = *q.device_ptr() as *const core::ffi::c_void;
             let k_cache_ptr = *k_cache.device_ptr() as *const core::ffi::c_void;
@@ -1538,10 +1563,10 @@ impl FlashAttnCache {
                 /* seqlen_q_rounded */ seqlen_q_rounded as u32,
                 /* seqlen_k_rounded */ seqlen_k_rounded as u32,
                 /* is_bf16 */ is_bf16,
-                /* is_causal */ 1,
+                /* is_causal */ is_causal,
                 /* upadded_lse */ 1,
-                /* window_size_left */ -1,
-                /* window_size_right */ -1,
+                /* window_size_left */ window_size_left,
+                /* window_size_right */ window_size_right,
                 /* block_table_batch_stride */ block_table_batch_stride as u32,
                 /* page_block_size */ block_size as i32,
                 num_splits as i32,
@@ -1615,13 +1640,16 @@ impl candle::CustomOp3 for FlashAttnCache {
 ///
 /// The resulting tensor has dimensions `(total_q, num_heads_q, head_size)`.
 #[cfg(feature = "flash-decoding")]
-pub fn flash_attn_with_kvcache(
+fn flash_attn_with_kvcache_impl(
     q: &Tensor,
     k_cache: &Tensor,
     v_cache: &Tensor,
     context_lens: &Tensor,
     block_table: &Tensor,
     softmax_scale: f32,
+    window_size_left: Option<usize>,
+    window_size_right: Option<usize>,
+    softcap: Option<f32>,
 ) -> Result<Tensor> {
     let (batch_size, mut seqlen_q, num_heads, head_size_og) = q.dims4()?;
     let (_, _, num_heads_k, _) = k_cache.dims4()?;
@@ -1643,7 +1671,9 @@ pub fn flash_attn_with_kvcache(
         context_lens: Some(context_lens.to_owned()),
         block_table: Some(block_table.to_owned()),
         alibi_slopes: None,
-        softcap: None,
+        window_size_left,
+        window_size_right,
+        softcap,
         seqlenq_ngroups_swapped,
         q_batch_stride,
     };
@@ -1655,4 +1685,53 @@ pub fn flash_attn_with_kvcache(
         o
     };
     Ok(o)
+}
+
+#[cfg(feature = "flash-decoding")]
+pub fn flash_attn_with_kvcache(
+    q: &Tensor,
+    k_cache: &Tensor,
+    v_cache: &Tensor,
+    context_lens: &Tensor,
+    block_table: &Tensor,
+    softmax_scale: f32,
+) -> Result<Tensor> {
+    // Backward-compatible default: causal decode, no softcap.
+    flash_attn_with_kvcache_impl(
+        q,
+        k_cache,
+        v_cache,
+        context_lens,
+        block_table,
+        softmax_scale,
+        None,
+        Some(0),
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "flash-decoding")]
+pub fn flash_attn_with_kvcache_windowed_softcap(
+    q: &Tensor,
+    k_cache: &Tensor,
+    v_cache: &Tensor,
+    context_lens: &Tensor,
+    block_table: &Tensor,
+    softmax_scale: f32,
+    softcap: Option<f32>,
+    window_size_left: Option<usize>,
+    window_size_right: Option<usize>,
+) -> Result<Tensor> {
+    flash_attn_with_kvcache_impl(
+        q,
+        k_cache,
+        v_cache,
+        context_lens,
+        block_table,
+        softmax_scale,
+        window_size_left,
+        window_size_right,
+        softcap,
+    )
 }
