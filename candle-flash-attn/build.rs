@@ -31,6 +31,8 @@ fn main() -> Result<()> {
             "kernels/flash_fwd_hdim64_fp16_causal_sm80.cu",
             "kernels/flash_fwd_hdim128_bf16_causal_sm80.cu",
             "kernels/flash_fwd_hdim64_bf16_causal_sm80.cu",
+            "kernels/flash_fwd_hdim256_fp16_causal_sm80.cu",
+            "kernels/flash_fwd_hdim256_bf16_causal_sm80.cu",
         ]
     };
 
@@ -40,6 +42,8 @@ fn main() -> Result<()> {
             "kernels/flash_fwd_split_hdim64_fp16_sm80.cu",
             "kernels/flash_fwd_split_hdim128_bf16_sm80.cu",
             "kernels/flash_fwd_split_hdim64_bf16_sm80.cu",
+            "kernels/flash_fwd_split_hdim256_fp16_sm80.cu",
+            "kernels/flash_fwd_split_hdim256_bf16_sm80.cu",
         ]);
     } else if flash_decoding_enabled {
         kernel_files.extend_from_slice(&[
