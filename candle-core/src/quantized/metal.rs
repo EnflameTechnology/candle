@@ -125,7 +125,10 @@ impl QMetalStorage {
         let src = crate::Storage::Cpu(crate::CpuStorage::F32(src));
         let mut qcpu_storage = crate::Device::Cpu.qzeros(elem_count, self.dtype)?;
         qcpu_storage.quantize(&src)?;
-        let buffer = self.device.new_buffer_with_data(&qcpu_storage.data()?)?;
+        let qdata = qcpu_storage.data()?;
+        let buffer = self
+            .device
+            .new_private_buffer_with_data(qdata.as_ref(), "isq_quantized_weight")?;
         self.buffer = buffer;
         Ok(())
     }

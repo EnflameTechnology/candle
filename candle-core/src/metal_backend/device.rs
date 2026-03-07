@@ -1,4 +1,4 @@
-use crate::{DType, Result};
+use crate::{DType, InferenceMode, Result};
 use candle_metal_kernels::Kernels;
 use metal::{Buffer, CommandBuffer, CommandQueue, MTLResourceOptions, NSUInteger};
 use std::collections::HashMap;
@@ -21,6 +21,7 @@ impl DeviceId {
 }
 
 type BufferMap = HashMap<(NSUInteger, MTLResourceOptions), Vec<Arc<Buffer>>>;
+
 pub(crate) struct Commands {
     /// Single command queue for the entire device.
     command_queue: CommandQueue,
@@ -74,16 +75,16 @@ impl Commands {
 
     pub fn wait_until_completed(&mut self) -> Result<()> {
         match self.command_buffer.status() {
+            metal::MTLCommandBufferStatus::NotEnqueued
+            | metal::MTLCommandBufferStatus::Enqueued => self.command_buffer.commit(),
             metal::MTLCommandBufferStatus::Committed
             | metal::MTLCommandBufferStatus::Scheduled
-            | metal::MTLCommandBufferStatus::Completed => {
-                panic!("Already committed");
-            }
-            _ => {}
+            | metal::MTLCommandBufferStatus::Completed => {}
+            metal::MTLCommandBufferStatus::Error => {}
         }
-        self.command_buffer.commit();
         self.command_buffer.wait_until_completed();
         self.command_buffer = self.command_queue.new_command_buffer().to_owned();
+        self.command_buffer_index = 0;
 
         Ok(())
     }
@@ -250,6 +251,48 @@ impl MetalDevice {
         Ok(new_buffer)
     }
 
+    /// Uploads CPU data into an exact-size private buffer.
+    ///
+    /// This is intended for long-lived weight buffers where keeping a managed
+    /// copy would unnecessarily inflate unified-memory usage.
+    pub fn new_private_buffer_with_data<T>(&self, data: &[T], _name: &str) -> Result<Arc<Buffer>> {
+        let size = core::mem::size_of_val(data) as NSUInteger;
+
+        let staging = self.device.new_buffer_with_data(
+            data.as_ptr().cast(),
+            size,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let mut buffers = self.buffers.write().map_err(MetalError::from)?;
+        let subbuffers = buffers
+            .entry((size, MTLResourceOptions::StorageModePrivate))
+            .or_insert(vec![]);
+        let private = if let Some(existing) = subbuffers
+            .iter()
+            .find(|buffer| Arc::strong_count(buffer) == 1 && buffer.length() == size)
+        {
+            existing.clone()
+        } else {
+            let buffer = Arc::new(
+                self.device
+                    .new_buffer(size, MTLResourceOptions::StorageModePrivate),
+            );
+            subbuffers.push(buffer.clone());
+            buffer
+        };
+        drop(buffers);
+
+        let command_buffer = self.command_buffer()?;
+        command_buffer.set_label("upload_private");
+        let blit = command_buffer.new_blit_command_encoder();
+        blit.set_label("upload_private_blit");
+        blit.copy_from_buffer(&staging, 0, &private, 0, size);
+        blit.end_encoding();
+
+        Ok(private)
+    }
+
     pub fn allocate_zeros(&self, size_in_bytes: usize, shared: bool) -> Result<Arc<Buffer>> {
         let buffer = if shared {
             let new_buffer = self.device.new_buffer(
@@ -287,12 +330,13 @@ impl MetalDevice {
         _name: &str,
     ) -> Result<Arc<Buffer>> {
         let mut buffers = self.buffers.write().map_err(MetalError::from)?;
-        if let Some(b) = find_available_buffer(size, option, &buffers) {
+        let exact_size = InferenceMode::is_enabled();
+        if let Some(b) = find_available_buffer(size, option, &buffers, exact_size) {
             // Cloning also ensures we increment the strong count
             return Ok(b.clone());
         }
 
-        let size = buf_size(size);
+        let size = if exact_size { size } else { buf_size(size) };
         let subbuffers = buffers.entry((size, option)).or_insert(vec![]);
 
         let new_buffer = self.device.new_buffer(size as NSUInteger, option);
@@ -331,11 +375,17 @@ fn find_available_buffer(
     size: NSUInteger,
     option: MTLResourceOptions,
     buffers: &BufferMap,
+    exact_size: bool,
 ) -> Option<Arc<Buffer>> {
     let mut best_buffer: Option<&Arc<Buffer>> = None;
     let mut best_buffer_size: NSUInteger = NSUInteger::MAX;
     for ((buffer_size, buffer_option), subbuffers) in buffers.iter() {
-        if buffer_size >= &size && buffer_size < &best_buffer_size && buffer_option == &option {
+        let size_match = if exact_size {
+            *buffer_size == size
+        } else {
+            *buffer_size >= size
+        };
+        if size_match && buffer_size < &best_buffer_size && buffer_option == &option {
             for sub in subbuffers {
                 if Arc::strong_count(sub) == 1 {
                     best_buffer = Some(sub);

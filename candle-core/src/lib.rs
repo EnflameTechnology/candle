@@ -65,6 +65,7 @@ pub mod dummy_cuda_backend;
 mod dummy_metal_backend;
 pub mod error;
 mod indexer;
+mod inference;
 pub mod layout;
 #[cfg(feature = "metal")]
 pub mod metal_backend;
@@ -96,6 +97,7 @@ pub use device::{Device, DeviceLocation, NdArray};
 pub use dtype::{DType, DTypeParseError, FloatDType, IntDType, WithDType};
 pub use error::{Context, Error, Result};
 pub use indexer::{IndexOp, TensorIndexer};
+pub use inference::InferenceMode;
 pub use layout::Layout;
 pub use shape::{Shape, D};
 pub use storage::Storage;
