@@ -365,6 +365,19 @@ impl Tensor {
         Self::zeros_impl(shape, dtype, device, sync.unwrap_or(false), false)
     }
 
+    /// Creates a new tensor backed by uninitialized storage.
+    ///
+    /// # Safety
+    ///
+    /// The returned tensor contains uninitialized memory and must be fully
+    /// written before any read.
+    pub unsafe fn empty_<S: Into<Shape>>(shape: S, dtype: DType, device: &Device) -> Result<Self> {
+        let none = BackpropOp::none();
+        let shape = shape.into();
+        let storage = device.alloc_uninit(&shape, dtype)?;
+        Ok(from_storage(storage, shape, none, false))
+    }
+
     /// Creates a new tensor filled with zeros with same shape, dtype, and device as the other
     /// tensor.
     ///
