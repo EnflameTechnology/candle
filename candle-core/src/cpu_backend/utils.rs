@@ -9,9 +9,7 @@ pub trait Map1 {
     fn map(&self, vs: &C, layout: &Layout) -> Result<C> {
         match vs {
             C::U8(vs) => Ok(C::U8(self.f(vs, layout)?)),
-            C::I8(vs) => Ok(C::I8(self.f(vs, layout)?)),
             C::U32(vs) => Ok(C::U32(self.f(vs, layout)?)),
-            C::I32(vs) => Ok(C::I32(self.f(vs, layout)?)),
             C::I64(vs) => Ok(C::I64(self.f(vs, layout)?)),
             C::BF16(vs) => Ok(C::BF16(self.f(vs, layout)?)),
             C::F16(vs) => Ok(C::F16(self.f(vs, layout)?)),
@@ -27,9 +25,7 @@ pub trait Map1Any {
     fn map(&self, vs: &C, layout: &Layout) -> Result<C> {
         match vs {
             C::U8(vs) => Ok(self.f(vs, layout, C::U8)?),
-            C::I8(vs) => Ok(self.f(vs, layout, C::I8)?),
             C::U32(vs) => Ok(self.f(vs, layout, C::U32)?),
-            C::I32(vs) => Ok(self.f(vs, layout, C::I32)?),
             C::I64(vs) => Ok(self.f(vs, layout, C::I64)?),
             C::BF16(vs) => Ok(self.f(vs, layout, C::BF16)?),
             C::F16(vs) => Ok(self.f(vs, layout, C::F16)?),
@@ -47,7 +43,6 @@ pub trait Map2 {
         match (v1, v2) {
             (C::U8(v1), C::U8(v2)) => Ok(C::U8(self.f(v1, l1, v2, l2)?)),
             (C::U32(v1), C::U32(v2)) => Ok(C::U32(self.f(v1, l1, v2, l2)?)),
-            (C::I32(v1), C::I32(v2)) => Ok(C::I32(self.f(v1, l1, v2, l2)?)),
             (C::I64(v1), C::I64(v2)) => Ok(C::I64(self.f(v1, l1, v2, l2)?)),
             (C::BF16(v1), C::BF16(v2)) => Ok(C::BF16(self.f(v1, l1, v2, l2)?)),
             (C::F16(v1), C::F16(v2)) => Ok(C::F16(self.f(v1, l1, v2, l2)?)),
@@ -71,7 +66,6 @@ pub trait Map2U8 {
         match (v1, v2) {
             (C::U8(v1), C::U8(v2)) => Ok(C::U8(self.f(v1, l1, v2, l2)?)),
             (C::U32(v1), C::U32(v2)) => Ok(C::U8(self.f(v1, l1, v2, l2)?)),
-            (C::I32(v1), C::I32(v2)) => Ok(C::U8(self.f(v1, l1, v2, l2)?)),
             (C::I64(v1), C::I64(v2)) => Ok(C::U8(self.f(v1, l1, v2, l2)?)),
             (C::BF16(v1), C::BF16(v2)) => Ok(C::U8(self.f(v1, l1, v2, l2)?)),
             (C::F16(v1), C::F16(v2)) => Ok(C::U8(self.f(v1, l1, v2, l2)?)),

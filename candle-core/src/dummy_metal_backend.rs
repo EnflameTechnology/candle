@@ -214,7 +214,12 @@ impl crate::backend::BackendDevice for MetalDevice {
         fail!()
     }
 
-    fn zeros_impl(&self, _shape: &Shape, _dtype: DType) -> Result<Self::Storage> {
+    fn zeros_impl(
+        &self,
+        _shape: &Shape,
+        _dtype: DType,
+        _sync_alloc: bool,
+    ) -> Result<Self::Storage> {
         Err(Error::NotCompiledWithMetalSupport)
     }
 

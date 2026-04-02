@@ -35,10 +35,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 symphonia = { version = "0.5.3", features = ["all"], optional = true }
 tokenizers = { workspace = true, features = ["onig"] }
-float_eq = "1"
 cpal = { version = "0.15.2", optional = true }
 pdf2image = { version = "0.1.2" , optional = true}
-ubridge = { git = "https://github.com/EnflameTechnology/Ubridge.git", version = "0.1.0", optional=true, rev = "c6423ab"}
 
 [dev-dependencies]
 anyhow = { workspace = true }
@@ -52,34 +50,30 @@ tracing = { workspace = true }
 tracing-chrome = { workspace = true }
 tracing-subscriber = { workspace = true }
 # Necessary to disambiguate with tokio in wasm examples which are 1.28.1
-tokio = "1.29.1"
+tokio = "1.43.0"
 
 [build-dependencies]
 anyhow = { workspace = true }
-bindgen_cuda = { version = "0.1.1", optional = true }
+cudaforge = { version= "0.1.5", optional = true}
 
 [features]
+default = []
 accelerate = ["dep:accelerate-src", "candle/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
-gcu = ["candle/gcu", "dep:half", "candle-nn/gcu", "candle-transformers/gcu"]
-eccl = ["candle/eccl", "dep:half", "candle-nn/gcu", "candle-nn/eccl", "candle-transformers/gcu", "ubridge/eccl"]
-scorpio = ["candle/gcu", "candle/scorpio", "dep:half", "candle-nn/gcu", "candle-transformers/gcu"]
-cuda = ["candle/cuda", "candle-nn/cuda", "candle-transformers/cuda", "dep:bindgen_cuda"]
+cuda = ["candle/cuda", "candle-nn/cuda", "candle-transformers/cuda", "dep:cudaforge"]
 cudnn = ["candle/cudnn"]
 flash-attn = ["cuda", "candle-transformers/flash-attn", "dep:candle-flash-attn"]
 mkl = ["dep:intel-mkl-src", "candle/mkl", "candle-nn/mkl", "candle-transformers/mkl"]
-nccl = ["cuda", "cudarc/nccl", "candle-nn/nccl", "dep:half"]
+nccl = ["cuda", "cudarc/nccl", "dep:half"]
 onnx = ["candle-onnx"]
 metal = ["candle/metal", "candle-nn/metal"]
-#default = ["gcu", "scorpio", "candle/gcu", "candle-nn/gcu", "candle-transformers/gcu",] #for gcu development
-microphone = ["cpal"]
+microphone = ["cpal", "rubato"]
 encodec = ["cpal", "symphonia", "rubato"]
-async = ["candle/async"]
-depth_anything_v2 = ["palette", "enterpolation"]
 mimi = ["cpal", "symphonia", "rubato"]
+depth_anything_v2 = ["palette", "enterpolation"]
 
 [[example]]
 name = "llama_multiprocess"
-#required-features = ["cuda", "nccl", "flash-attn"]
+required-features = ["cuda", "nccl", "flash-attn"]
 
 [[example]]
 name = "reinforcement-learning"

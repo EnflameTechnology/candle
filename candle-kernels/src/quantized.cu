@@ -4330,6 +4330,24 @@ extern "C" __global__ void
         (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
+typedef struct {
+    half    d;             // super-block scales/mins
+    half    dmin;
+    uint8_t scales[3*QK_K/64];
+    uint8_t qs[QK_K/2];        // 4--bit quants
+} block_q4_K_;
+
+// Unpacks the 6-bit scale and 6-bit min for a sub-block.
+__device__ void get_scale_min_k4_(int j, const uint8_t* __restrict__ q, uint8_t* __restrict__ d, uint8_t* __restrict__ m) {
+    if (j < 4) {
+        *d = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >> 4)  | ((q[j] >> 6) << 4);
+    }
+}
+
 /**
  * @brief CUDA kernel for quantizing float values into 4-bit blocks using a K-block format.
  *
@@ -4346,6 +4364,7 @@ extern "C" __global__ void
  *
  * @author
  *   Guoqing Bao
+ *   Part of the project: https://github.com/guoqingbao/vllm.rs/
  * @param[in]  x           Pointer to the input float array of size `num_blocks * QK_K`.
  *                         Each block contains QK_K floats, subdivided into 8 sub-blocks of 32 elements.
  * @param[out] y           Pointer to the output buffer of type `block_q4_K_[]`.
@@ -4456,6 +4475,276 @@ extern "C" __global__ void quantize_q4_k(const float* __restrict__ x, void* __re
     }
 }
 
+// CUDA kernel for quantizing a matrix of floats to the Q8_0 format.
+//
+// @author
+//   Guoqing Bao
+//  Part of the project: https://github.com/guoqingbao/vllm.rs/
+// Parameters:
+//   x:          Source matrix of f32 values. Assumed to be in contiguous row-major layout.
+//   y:          Destination buffer for the quantized q8_0 blocks.
+//   k:          The number of elements (columns) in a single row of the source matrix.
+//   kx_padded:  The padded row size, which must be a multiple of QK8_0.
+extern "C" __global__ void quantize_q8_0(
+    const float * __restrict__ x,
+    void * __restrict__ y,
+    const int k,
+    const int kx_padded
+) {
+    // blockIdx.x corresponds to the block index within the row.
+    // blockIdx.y corresponds to the row index.
+    // threadIdx.x corresponds to the thread index within the data block (0-31).
+    const int block_idx = blockIdx.x;
+    const int row_idx   = blockIdx.y;
+    const int tid       = threadIdx.x;
+
+    // --- Source Pointer Calculation ---
+    // This calculation assumes the source tensor 'x' is a contiguous row-major matrix.
+    // The offset to the start of the current row is (row_idx * k).
+    // The offset to the start of the current block within that row is (block_idx * QK8_0).
+    const float * const x_block_start = x + (size_t)row_idx * k + (size_t)block_idx * QK8_0;
+
+    // --- Destination Pointer Calculation ---
+    // The destination buffer has a different stride based on the padded row size.
+    // The size of one quantized row in bytes is the number of blocks per padded row
+    // multiplied by the size of a single q8_0 block.
+    const size_t dst_row_size_bytes = (size_t)(kx_padded / QK8_0) * sizeof(block_q8_0);
+    block_q8_0 * const y_block = (block_q8_0 *)((uint8_t*)y + (size_t)row_idx * dst_row_size_bytes) + block_idx;
+
+    // Determine the global element index this thread is responsible for within the original row.
+    const int current_idx_in_row = block_idx * QK8_0 + tid;
+
+    // Find the absolute maximum value (amax) in the block ---
+
+    // Statically allocated shared memory for the parallel reduction.
+    __shared__ float sdata[QK8_0];
+
+    // Each thread loads one float into shared memory.
+    // If the index is outside the original row size 'k', it's padding; load 0.
+    if (current_idx_in_row < k) {
+        sdata[tid] = fabsf(x_block_start[tid]);
+    } else {
+        sdata[tid] = 0.0f; // Padding threads must participate with a neutral value.
+    }
+    __syncthreads();
+
+    // Perform parallel reduction in shared memory to find the max value.
+    for (int s = QK8_0 / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+        }
+        __syncthreads();
+    }
+
+    // Calculate and store the scaling factor 'd' ---
+
+    // Use shared memory to hold the final scale 'd' to ensure visibility for all threads.
+    __shared__ float d_shared;
+    if (tid == 0) {
+        const float amax = sdata[0];
+        // This logic now matches the CPU implementation exactly.
+        // If amax is 0, d will be 0. Otherwise, d = amax / 127.0.
+        d_shared = amax / 127.0f;
+        y_block->d = __float2half(d_shared);
+    }
+    __syncthreads(); // Ensure d_shared is written before other threads read it.
+
+    // Quantize and store the 8-bit values ---
+
+    // Calculate the inverse scale. If d is 0, iscale will be 0.
+    const float iscale = (d_shared != 0.0f) ? 1.0f / d_shared : 0.0f;
+
+    // Each thread quantizes one value. Handle padding.
+    if (current_idx_in_row < k) {
+        const float val = x_block_start[tid];
+        y_block->qs[tid] = roundf(val * iscale);
+    } else {
+        y_block->qs[tid] = 0; // Write 0 for padded elements.
+    }
+}
+
+
+/**
+ * @brief CUDA kernel to quantize one block of 256 floats into the Q6_K format.
+ *
+ * Each CUDA block of 64 threads processes one Q6_K block (256 floats).
+ * @author
+ *   Guoqing Bao
+ *   Part of the project: https://github.com/guoqingbao/vllm.rs/
+ * @param xx   Input tensor pointer (float*).
+ * @param vy   Output tensor pointer (void*, assumed to be block_q6_K*).
+ * @param n    Number of rows in the input tensor.
+ * @param k    Number of columns (features) in the input tensor (must be a multiple of QK_K).
+ */
+extern "C" __global__ void quantize_q6_k(const float * __restrict__ xx, void * __restrict__ vy, int n, int k) {
+    
+    // --- Shared Memory ---
+    // Shared memory for finding the block-level max absolute value
+    __shared__ float s_block_max[64];
+    // Shared memory for finding the 16 sub-block max absolute values
+    __shared__ float s_sub_max[64];
+    // Shared memory for storing the 16 quantized sub-block scales
+    __shared__ int8_t s_scales[16];
+    // Shared memory for the block-level inverse scale (id)
+    __shared__ float s_id;
+
+    // --- Thread and Block Indexing ---
+    const int tid = threadIdx.x; // Thread ID (0-63)
+    
+    // blockIdx.x maps to the k-dimension (column blocks)
+    // blockIdx.y maps to the n-dimension (rows)
+    const int i_block = blockIdx.x; // Block index along the k-dimension (0 to k/QK_K - 1)
+    const int i_row   = blockIdx.y; // Row index (0 to n - 1)
+
+    // Pointers to the current block's input and output
+    const float * x = xx + i_row * k + i_block * QK_K;
+    block_q6_K * y = ((block_q6_K *) vy) + i_row * (k / QK_K) + i_block;
+
+    // --- 1. Find Block-Level Max Absolute Value (amax) ---
+    // Each thread loads 4 values and finds its local max
+    float my_max = 0.0f;
+    my_max = fmaxf(my_max, fabsf(x[tid +   0]));
+    my_max = fmaxf(my_max, fabsf(x[tid +  64]));
+    my_max = fmaxf(my_max, fabsf(x[tid + 128]));
+    my_max = fmaxf(my_max, fabsf(x[tid + 192]));
+    s_block_max[tid] = my_max;
+    __syncthreads();
+
+    // Parallel reduction in shared memory to find the block's amax
+    for (int s = 32; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_block_max[tid] = fmaxf(s_block_max[tid], s_block_max[tid + s]);
+        }
+        __syncthreads();
+    }
+    // amax is now in s_block_max[0]
+
+    // --- 2. Calculate and Store Block-Level Scale (d) and Inverse Scale (id) ---
+    if (tid == 0) {
+        const float amax = s_block_max[0];
+        // Dequant logic: y = d * (sc * q_s)
+        // Max possible value is d * (127 * 31)
+        const float d = amax / (127.0f * 31.0f);
+        y->d = __float2half_rn(d);
+        s_id = (d > 0.0f) ? (1.0f / d) : 0.0f;
+    }
+    __syncthreads();
+    
+    // All threads load the inverse scale
+    const float id = s_id;
+
+    // --- 3. Find and Store Sub-Block Scales (sc) ---
+    // 64 threads, 16 sub-blocks. 4 threads per sub-block.
+    const int j = tid / 4;       // Sub-block index (0-15)
+    const int i_in_sub = tid % 4; // Thread's index within the sub-block (0-3)
+
+    // Each thread loads 4 values from its assigned sub-block
+    // (j*16) is the start of the sub-block
+    // (i_in_sub * 4) is not right. (i_in_sub) is the offset.
+    // Each thread loads 4 values:
+    const float v0 = fabsf(x[j*16 + i_in_sub +  0] * id);
+    const float v1 = fabsf(x[j*16 + i_in_sub +  4] * id);
+    const float v2 = fabsf(x[j*16 + i_in_sub +  8] * id);
+    const float v3 = fabsf(x[j*16 + i_in_sub + 12] * id);
+    
+    // Find max of the 4 scaled values
+    s_sub_max[tid] = fmaxf(fmaxf(v0, v1), fmaxf(v2, v3));
+    __syncthreads();
+
+    // The first thread in each group of 4 reduces its group's max
+    if (i_in_sub == 0) {
+        // Find max among the 4 threads for this sub-block
+        const float s_amax = fmaxf(fmaxf(s_sub_max[tid], s_sub_max[tid+1]), 
+                                   fmaxf(s_sub_max[tid+2], s_sub_max[tid+3]));
+
+        // Quantize the sub-block scale
+        // Logic: f_scaled = sc * q_s. Max f_scaled is s_amax. Max q_s is 31.
+        // So, sc = s_amax / 31.0
+        const float sc_f = roundf(s_amax / 31.0f);
+
+        // Clamp to 8-bit signed integer range and store
+        const int8_t sc_val = (int8_t)fminf(fmaxf(sc_f, -128.0f), 127.0f);
+        s_scales[j] = sc_val;
+        y->scales[j] = sc_val;
+    }
+    __syncthreads();
+
+    // --- 4. Quantize Values and Pack into ql and qh ---
+    // Use the same thread mapping as the dequantization kernel
+    const int ip = tid / 32;       // 0 or 1 (for first or second 128 values)
+    const int il = tid - 32 * ip; // 0-31
+
+    // Calculate indices for the 4 values this thread will quantize
+    const int val_idx_0 = 128*ip + il +  0;
+    const int val_idx_1 = 128*ip + il + 32;
+    const int val_idx_2 = 128*ip + il + 64;
+    const int val_idx_3 = 128*ip + il + 96;
+
+    // Find the corresponding sub-block scales
+    // This logic matches the 'is' and 'sc[0/2/4/6]' access in the dequant kernel
+    const int is = 8*ip + il/16;
+    const int sc_idx_0 = is + 0;
+    const int sc_idx_1 = is + 2;
+    const int sc_idx_2 = is + 4;
+    const int sc_idx_3 = is + 6;
+
+    // Get scales from shared memory
+    const float sc_0 = (float)s_scales[sc_idx_0];
+    const float sc_1 = (float)s_scales[sc_idx_1];
+    const float sc_2 = (float)s_scales[sc_idx_2];
+    const float sc_3 = (float)s_scales[sc_idx_3];
+
+    // Calculate inverse scales
+    const float isc_0 = (sc_0 != 0.0f) ? 1.0f / sc_0 : 0.0f;
+    const float isc_1 = (sc_1 != 0.0f) ? 1.0f / sc_1 : 0.0f;
+    const float isc_2 = (sc_2 != 0.0f) ? 1.0f / sc_2 : 0.0f;
+    const float isc_3 = (sc_3 != 0.0f) ? 1.0f / sc_3 : 0.0f;
+
+    // Quantize the 4 values
+    // val_q = (x * id) / sc = x / d / sc
+    // This value should be in the range [-31, 31]
+    const float val_q_0 = x[val_idx_0] * id * isc_0;
+    const float val_q_1 = x[val_idx_1] * id * isc_1;
+    const float val_q_2 = x[val_idx_2] * id * isc_2;
+    const float val_q_3 = x[val_idx_3] * id * isc_3;
+
+    // Round and clamp to 6-bit signed range [-32, 31]
+    const int8_t q_s_0 = (int8_t)fminf(fmaxf(roundf(val_q_0), -32.0f), 31.0f);
+    const int8_t q_s_1 = (int8_t)fminf(fmaxf(roundf(val_q_1), -32.0f), 31.0f);
+    const int8_t q_s_2 = (int8_t)fminf(fmaxf(roundf(val_q_2), -32.0f), 31.0f);
+    const int8_t q_s_3 = (int8_t)fminf(fmaxf(roundf(val_q_3), -32.0f), 31.0f);
+
+    // Shift to 6-bit unsigned range [0, 63]
+    const uint8_t q_val_0 = (uint8_t)(q_s_0 + 32);
+    const uint8_t q_val_1 = (uint8_t)(q_s_1 + 32);
+    const uint8_t q_val_2 = (uint8_t)(q_s_2 + 32);
+    const uint8_t q_val_3 = (uint8_t)(q_s_3 + 32);
+
+    // Pack the 6-bit values into ql and qh
+    // This is the reverse of the dequantization packing
+    
+    // Pack lower 4 bits into ql
+    // ql[0]  = (q_val_0 lower 4 bits) | (q_val_2 lower 4 bits << 4)
+    // ql[32] = (q_val_1 lower 4 bits) | (q_val_3 lower 4 bits << 4)
+    const uint8_t ql_0  = (q_val_0 & 0x0F) | ((q_val_2 & 0x0F) << 4);
+    const uint8_t ql_32 = (q_val_1 & 0x0F) | ((q_val_3 & 0x0F) << 4);
+
+    // Pack upper 2 bits into qh
+    // qh[0] = (q_val_0 upper 2 bits) << 0 |
+    //         (q_val_1 upper 2 bits) << 2 |
+    //         (q_val_2 upper 2 bits) << 4 |
+    //         (q_val_3 upper 2 bits) << 6
+    const uint8_t qh_0 = ((q_val_0 >> 4) & 0x03) << 0 |
+                         ((q_val_1 >> 4) & 0x03) << 2 |
+                         ((q_val_2 >> 4) & 0x03) << 4 |
+                         ((q_val_3 >> 4) & 0x03) << 6;
+
+    // Write to global memory
+    y->ql[64*ip + il +  0] = ql_0;
+    y->ql[64*ip + il + 32] = ql_32;
+    y->qh[32*ip + il]      = qh_0;
+}
+
 
 
 /**
@@ -4472,6 +4761,7 @@ extern "C" __global__ void quantize_q4_k(const float* __restrict__ x, void* __re
  *
  * @author
  *   Guoqing Bao
+ *   Part of the project: https://github.com/guoqingbao/vllm.rs/
  * @param all_weights Pointer to the beginning of the weight tensor [num_experts, n, k].
  * @param all_inputs Pointer to the beginning of the input tensor [batch * topk, k].
  * @param indices Pointer to the expert indices for each task [batch * topk].
@@ -4518,7 +4808,7 @@ __device__ void indexed_moe_forward(
     // Calculate strides
     const size_t weight_block_size = sizeof(block_q_t);
     const size_t input_block_size = sizeof(block_q8_1);
-    const size_t weight_expert_stride_bytes = (size_t)(n * k) / QK_K * weight_block_size;
+    const size_t weight_expert_stride_bytes = (size_t)(n * k) / qk * weight_block_size;
     const size_t input_task_stride_bytes = (size_t)k_padded / QK8_1 * input_block_size;
     const size_t output_task_stride_elems = n;
 
@@ -4660,4 +4950,379 @@ extern "C" __global__ void indexed_moe_forward_q8_0_q8_1(
     const int input_dim1) {
     indexed_moe_forward<QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1>
         (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
+}
+
+/**
+ * @brief Performs an indexed, batched matrix-vector multiplication for quantized tensors (for MoE models).
+ *
+ * This kernel handles a batch of `total_tasks` independent operations. Each task consists
+ * of multiplying a Q8_1 quantized input vector with a GGUF quantized weight matrix selected
+ * by an index.
+ *
+ * Parallelization Strategy:
+ * - The grid is 2D: gridDim.y corresponds to the task index, and gridDim.x corresponds to the row blocks of the output matrix.
+ * - `blockIdx.y`: Identifies which task to perform from the batch (`0` to `total_tasks - 1`).
+ * - `blockIdx.x`: Used internally by `mul_mat_vec_q` to parallelize the dot products across the rows of the weight matrix.
+ *
+ * @author
+ *   Guoqing Bao
+ *   Part of the project: https://github.com/guoqingbao/vllm.rs/
+ * @param all_weights Pointer to the beginning of the weight tensor [num_experts, n, k].
+ * @param all_inputs Pointer to the beginning of the input tensor [batch * topk, k].
+ * @param indices Pointer to the expert indices for each task [batch * topk].
+ * @param all_outputs Pointer to the beginning of the output tensor [batch * topk, n].
+ * @param n The number of output features (rows in the weight matrix).
+ * @param k The number of input features (columns in the weight matrix).
+ * @param total_tasks The total number of tasks to process, typically batch_size * topk.
+ * @param k_padded The value of k padded to a multiple of MATRIX_ROW_PADDING.
+ * @param weight_expert_stride_bytes The stride in bytes to get from one expert matrix to the next.
+ * @param input_task_stride_bytes The stride in bytes to get from one quantized input vector to the next.
+ * @param output_task_stride_elems The stride in elements (f32) to get from one output vector to the next.
+ */
+// Each block handles: up to 8 batch items (one per warp) × 1 expert (grid.z)
+// blockDim = (32, 8, 1)   // 8 warps
+// grid    = (ceil_div(n, rows_per_block), ceil_div(batch, 8), topk)
+template <int ncols_y, int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
+__device__ __forceinline__ void indexed_moe_forward_batch(
+    const void * __restrict__ all_weights,    // [num_experts, n, k] in qK
+    const void * __restrict__ all_inputs,     // [batch, input_dim1, k] in q8_1
+    const unsigned int * __restrict__ indices,// [batch, topk]
+    float * __restrict__ all_outputs,         // [batch, topk, n] in f32
+    const int n,
+    const int k,
+    const int batch,
+    const int topk, 
+    const int k_padded,
+    const int input_dim1
+) {
+    // which expert are we computing?
+    const int kk = blockIdx.z;        // 0..topk-1
+    if (kk >= topk) return;
+
+    // group of up to 8 batch items
+    const int start_b = blockIdx.y * ncols_y;
+
+    // which row(s) of the output
+    constexpr int rows_per_block = 1; // can change to 2 if beneficial
+    const int row0 = rows_per_block * blockIdx.x;
+    if (row0 >= n) return;
+
+    // warp + lane
+    const int warp_id = threadIdx.y;      // 0..ncols_y-1
+    const int lane_id = threadIdx.x;      // 0..31
+    const int b = start_b + warp_id;
+    if (warp_id >= ncols_y || b >= batch) {
+        return; // idle warp
+    }
+
+    // strides
+    const size_t weight_expert_stride_bytes = (size_t)(n * k) / qk * sizeof(block_q_t);
+    const size_t input_task_stride_bytes    = (size_t)k_padded / QK8_1 * sizeof(block_q8_1);
+    const size_t output_task_stride_elems   = (size_t)n;
+
+    // pick expert for (b, kk)
+    const unsigned int expert_id = indices[b * topk + kk];
+    const block_q_t * __restrict__ w_expert =
+        (const block_q_t *)((const char *)all_weights + (size_t)expert_id * weight_expert_stride_bytes);
+
+    // select input row:
+    // input_dim1 == 1   -> inputs[b, 0, :]
+    // input_dim1 == topk-> inputs[b, kk, :]
+    const int input_index = (input_dim1 == 1) ? b : (b * topk + kk);
+    const block_q8_1 * __restrict__ y_ptr =
+        (const block_q8_1 *)((const char *)all_inputs + (size_t)input_index * input_task_stride_bytes);
+
+    // dot-product tiling along k
+    const int blocks_per_row_x = k / qk;
+    const int blocks_per_iter  = vdr * WARP_SIZE / qi; // no nwarps factor: one warp per batch item
+
+    // accumulators for rows_per_block rows (usually 1)
+    float acc[rows_per_block];
+    #pragma unroll
+    for (int i = 0; i < rows_per_block; ++i) acc[i] = 0.0f;
+
+    #pragma unroll
+    for (int kbx = lane_id / (qi / vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk / QK8_1);
+        const int kqs = vdr * (lane_id % (qi / vdr));
+
+        #pragma unroll
+        for (int i = 0; i < rows_per_block; ++i) {
+            const int row = row0 + i;
+            if (row >= n) break;
+            acc[i] += vec_dot_q_cuda(
+                &w_expert[kbx + row * blocks_per_row_x],
+                &y_ptr[kby],
+                kqs);
+        }
+    }
+
+    // intra-warp reduction and writeout
+    #pragma unroll
+    for (int i = 0; i < rows_per_block; ++i) {
+        float v = warp_reduce_sum(acc[i]);
+        if (lane_id == 0 && row0 + i < n) {
+            float * __restrict__ out_ptr =
+                all_outputs + ((size_t)b * topk + kk) * output_task_stride_elems;
+            out_ptr[row0 + i] = v;
+        }
+    }
+}
+
+extern "C" __global__ void indexed_moe_forward_q2k_q8_1_b8(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+    indexed_moe_forward_batch<8, QK_K, QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
+}
+
+extern "C" __global__ void indexed_moe_forward_q3k_q8_1_b8(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+    indexed_moe_forward_batch<8, QK_K, QI3_K, block_q3_K, VDR_Q3_K_Q8_1_MMVQ, vec_dot_q3_K_q8_1>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
+}
+
+extern "C" __global__ void indexed_moe_forward_q4k_q8_1_b8(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+    indexed_moe_forward_batch<8, QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1>(
+        all_weights, all_inputs, indices, all_outputs,
+        n, k, batch, topk, k_padded, input_dim1);
+}
+
+extern "C" __global__ void indexed_moe_forward_q5k_q8_1_b8(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+    indexed_moe_forward_batch<8, QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
+}
+
+extern "C" __global__ void indexed_moe_forward_q6k_q8_1_b8(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+    indexed_moe_forward_batch<8, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
+}
+
+extern "C" __global__ void indexed_moe_forward_q8_0_q8_1_b8(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+    indexed_moe_forward_batch<8, QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
+}
+
+/**
+ * @brief A lookup table for converting a 4-bit MXFP4 value to a 32-bit float.
+ *
+ * MXFP4 (F4E2M1) has 1 sign bit, 2 exponent bits, and 1 mantissa bit.
+ * The values are pre-calculated based on the user's provided Rust implementation logic,
+ * which appears to be a common variant of the format. Storing this in constant
+ * memory provides fast, uniform access for all threads in a warp.
+ *
+ * Index (4-bit value) -> float value
+ */
+__constant__ float d_mxfp4_to_float_lut[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+    // Note: The negative zero from the spec is treated as 0.0f here.
+    // The spec's NaN/Inf values are replaced by +/-6.0f to match the apparent
+    // logic from the sample code.
+};
+
+/**
+ * @brief Converts an 8-bit F8E8M0 scale value to a 32-bit float.
+ *
+ * F8E8M0 is an 8-bit floating-point format with 8 exponent bits and 0 mantissa bits.
+ * The conversion formula is 2^(value - bias), where the bias is 127.
+ * The value 0xFF (255) is treated as NaN, as seen in the reference code.
+ *
+ * @param scale_val The 8-bit F8E8M0 scale value.
+ * @return The corresponding 32-bit float value.
+ */
+__device__ __forceinline__ float f8e8m0_to_float(unsigned char scale_val) {
+    if (scale_val == 0xFF) {
+        return NAN;
+    }
+    // Efficiently compute 2^(scale_val - 127) using ldexpf
+    // ldexpf(x, exp) computes x * 2^exp
+    return ldexpf(1.0f, static_cast<int>(scale_val) - 127);
+}
+
+
+//----------------------------------------------------------------------------
+// MXFP4 Dequantization Kernel
+//----------------------------------------------------------------------------
+
+/**
+ * @brief Dequantizes MXFP4 weights to a specified output type (fp32, fp16, or bf16).
+ *
+ * This kernel uses a grid-stride loop pattern where each thread is responsible
+ * for dequantizing one output element. This ensures that all elements are processed
+ * regardless of the grid size.
+ *
+ * The core logic for each thread is:
+ * 1. Calculate its global output index `idx`.
+ * 2. Determine the corresponding row and column in the weight matrix.
+ * 3. Identify the weight group and find the associated scale index.
+ * 4. Fetch the F8E8M0 scale and convert it to float.
+ * 5. Fetch the packed byte containing two MXFP4 weights.
+ * 6. Extract the correct 4-bit nibble for the current element.
+ * 7. Convert the 4-bit weight to float using the lookup table.
+ * 8. Multiply the weight by the scale.
+ * 9. Cast to the target output type and store the result.
+ *
+ * @author
+ *   Guoqing Bao
+ *   Part of the project: https://github.com/guoqingbao/vllm.rs/
+ * @tparam T The output data type (float, __half, or __nv_bfloat16).
+ * @param out Pointer to the output tensor on the GPU.
+ * @param w_q Pointer to the quantized MXFP4 input weights on the GPU.
+ * @param scales Pointer to the F8E8M0 scales on the GPU.
+ * @param total_elements The total number of output elements.
+ * @param weights_per_row The number of dequantized weights in a single row (unpacked).
+ * @param packed_row_len The length of a packed row in bytes.
+ * @param groups_per_row The number of groups in a single row.
+ * @param group_size The number of weights per group.
+ */
+template <typename T>
+__device__ __forceinline__ void dequantize_mxfp4_kernel(
+    T* __restrict__ out,
+    const unsigned char* __restrict__ w_q,
+    const unsigned char* __restrict__ scales,
+    const long long total_elements,
+    const int weights_per_row,
+    const int packed_row_len,
+    const int groups_per_row,
+    const int group_size)
+{
+    // Using a grid-stride loop to process all elements, making the kernel
+    // robust to different grid sizes.
+    for (long long idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total_elements;
+         idx += gridDim.x * blockDim.x)
+    {
+        // 1. Calculate row and column for the current output element
+        const int row = idx / weights_per_row;
+        const int col = idx % weights_per_row;
+
+        // 2. Calculate the index for the scale factor
+        const int group_idx_in_row = col / group_size;
+        const int scale_idx = row * groups_per_row + group_idx_in_row;
+
+        // 3. Fetch and convert the scale
+        const float scale_val = f8e8m0_to_float(scales[scale_idx]);
+
+        // 4. Locate and fetch the packed byte containing the weight
+        // Each byte contains two 4-bit weights.
+        const int byte_idx_in_row = col / 2;
+        const unsigned char packed_byte = w_q[row * packed_row_len + byte_idx_in_row];
+
+        // 5. Extract the 4-bit nibble
+        // If col is even, we take the lower 4 bits. If odd, the upper 4 bits.
+        const unsigned char fp4_bits = (col % 2 == 0)
+            ? (packed_byte & 0x0F)
+            : ((packed_byte >> 4) & 0x0F);
+
+        // 6. Convert the 4-bit weight to float using the constant memory LUT
+        const float weight_val = d_mxfp4_to_float_lut[fp4_bits];
+
+        // 7. Perform dequantization and store the result
+        // The static_cast handles conversion to the target type T.
+        out[idx] = static_cast<T>(weight_val * scale_val);
+    }
+}
+
+extern "C" __global__ void dequantize_mxfp4_f16(
+    __half* __restrict__ out,
+    const unsigned char* __restrict__ w_q,
+    const unsigned char* __restrict__ scales,
+    const long long total_elements,
+    const int weights_per_row,
+    const int packed_row_len,
+    const int groups_per_row,
+    const int group_size) 
+{
+    dequantize_mxfp4_kernel<__half>(
+        out, w_q, scales,
+        total_elements, weights_per_row,
+        packed_row_len, groups_per_row, group_size);
+}
+
+extern "C" __global__ void dequantize_mxfp4_bf16(
+    __nv_bfloat16* __restrict__ out,
+    const unsigned char* __restrict__ w_q,
+    const unsigned char* __restrict__ scales,
+    const long long total_elements,
+    const int weights_per_row,
+    const int packed_row_len,
+    const int groups_per_row,
+    const int group_size) {
+    dequantize_mxfp4_kernel<__nv_bfloat16>(
+        out, w_q, scales,
+        total_elements, weights_per_row,
+        packed_row_len, groups_per_row, group_size);
+}
+
+extern "C" __global__ void dequantize_mxfp4_f32(
+        float* __restrict__ out,
+    const unsigned char* __restrict__ w_q,
+    const unsigned char* __restrict__ scales,
+    const long long total_elements,
+    const int weights_per_row,
+    const int packed_row_len,
+    const int groups_per_row,
+    const int group_size) {
+        dequantize_mxfp4_kernel<float>(
+        out, w_q, scales,
+        total_elements, weights_per_row,
+        packed_row_len, groups_per_row, group_size);
 }

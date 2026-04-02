@@ -13,13 +13,13 @@ extern crate accelerate_src;
 extern crate intel_mkl_src;
 
 use anyhow::{bail, Error as E, Result};
+use clap::{Parser, ValueEnum};
+
 use candle::{DType, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
-use clap::{Parser, ValueEnum};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use std::io::Write;
-use std::path::Path;
 
 use candle_transformers::models::llama as model;
 use model::{Llama, LlamaConfig};
@@ -65,8 +65,8 @@ struct Args {
     cpu: bool,
 
     /// The temperature used to generate samples.
-    #[arg(long)]
-    temperature: Option<f64>,
+    #[arg(long, default_value_t = 0.8)]
+    temperature: f64,
 
     /// Nucleus sampling probability cutoff.
     #[arg(long)]
@@ -107,27 +107,19 @@ struct Args {
     revision: Option<String>,
 
     /// The model size to use.
-    #[arg(long, default_value = "v2")]
+    #[arg(long, default_value = "v3")]
     which: Which,
 
     #[arg(long)]
     use_flash_attn: bool,
 
-    /// The folder name that contains safetensor weights and json files
-    /// (same structure as huggingface online)
-    #[arg(long)]
-    weight_path: Option<String>,
-
     /// Penalty to be applied for repeating tokens, 1. means no penalty.
-    #[arg(long, default_value_t = 1.)]
+    #[arg(long, default_value_t = 1.1)]
     repeat_penalty: f32,
 
     /// The context size to consider for the repeat penalty.
     #[arg(long, default_value_t = 128)]
     repeat_last_n: usize,
-
-    #[arg(long, default_value_t = 1)]
-    batch_size: usize,
 }
 
 fn main() -> Result<()> {
@@ -143,13 +135,14 @@ fn main() -> Result<()> {
     } else {
         None
     };
-    let device = candle_examples::device(false)?;
+
+    let device = candle_examples::device(args.cpu)?;
     let dtype = match args.dtype.as_deref() {
         Some("f16") => DType::F16,
         Some("bf16") => DType::BF16,
         Some("f32") => DType::F32,
         Some(dtype) => bail!("Unsupported dtype {dtype}"),
-        None => DType::BF16,
+        None => DType::F16,
     };
     let (llama, tokenizer_filename, mut cache, config) = {
         let api = Api::new()?;
@@ -179,15 +172,9 @@ fn main() -> Result<()> {
         println!("loading the model weights from {model_id}");
         let revision = args.revision.unwrap_or("main".to_string());
         let api = api.repo(Repo::with_revision(model_id, RepoType::Model, revision));
-        let tokenizer_filename = match &args.weight_path {
-            Some(path) => Path::new(path).join("tokenizer.json"),
-            _ => api.get("tokenizer.json")?,
-        };
 
-        let config_filename = match &args.weight_path {
-            Some(path) => Path::new(path).join("config.json"),
-            _ => api.get("config.json")?,
-        };
+        let tokenizer_filename = api.get("tokenizer.json")?;
+        let config_filename = api.get("config.json")?;
         let config: LlamaConfig = serde_json::from_slice(&std::fs::read(config_filename)?)?;
         let config = config.into_config(args.use_flash_attn);
 
@@ -200,13 +187,9 @@ fn main() -> Result<()> {
             | Which::V31Instruct
             | Which::V32_3b
             | Which::V32_3bInstruct
-            | Which::Solar10_7B => match &args.weight_path {
-                Some(path) => candle_examples::hub_load_local_safetensors(
-                    path,
-                    "model.safetensors.index.json",
-                )?,
-                _ => candle_examples::hub_load_safetensors(&api, "model.safetensors.index.json")?,
-            },
+            | Which::Solar10_7B => {
+                candle_examples::hub_load_safetensors(&api, "model.safetensors.index.json")?
+            }
             Which::SmolLM2_360M
             | Which::SmolLM2_360MInstruct
             | Which::SmolLM2_135M
@@ -215,16 +198,9 @@ fn main() -> Result<()> {
             | Which::SmolLM2_1BInstruct
             | Which::V32_1b
             | Which::V32_1bInstruct
-            | Which::TinyLlama1_1BChat => match &args.weight_path {
-                Some(path) => {
-                    let mut filenames = vec![];
-                    filenames.push(Path::new(path).join("model.safetensors"));
-                    filenames
-                }
-                _ => {
-                    vec![api.get("model.safetensors")?]
-                }
-            },
+            | Which::TinyLlama1_1BChat => {
+                vec![api.get("model.safetensors")?]
+            }
         };
         let cache = model::Cache::new(!args.no_kv_cache, dtype, &config, &device)?;
 
@@ -248,7 +224,7 @@ fn main() -> Result<()> {
     println!("starting the inference loop");
     print!("{prompt}");
     let mut logits_processor = {
-        let temperature = args.temperature.unwrap_or(0.);
+        let temperature = args.temperature;
         let sampling = if temperature <= 0. {
             Sampling::ArgMax
         } else {
@@ -275,25 +251,8 @@ fn main() -> Result<()> {
             start_gen = std::time::Instant::now()
         }
         let ctxt = &tokens[tokens.len().saturating_sub(context_size)..];
-        let input = Tensor::new(ctxt, &device)?;
-        let input = if args.batch_size > 1 {
-            let dims = input.layout().dims();
-            input
-                .broadcast_as((
-                    args.batch_size,
-                    if dims.len() > 1 { dims[1] } else { dims[0] },
-                ))?
-                .contiguous()?
-        } else {
-            input.unsqueeze(0)?
-        };
+        let input = Tensor::new(ctxt, &device)?.unsqueeze(0)?;
         let logits = llama.forward(&input, context_index, &mut cache)?;
-        let logits = if args.batch_size > 1 {
-            logits.narrow(0, 0, 1)?
-        } else {
-            logits
-        };
-
         let logits = logits.squeeze(0)?;
         let logits = if args.repeat_penalty == 1. {
             logits
@@ -329,10 +288,10 @@ fn main() -> Result<()> {
         print!("{rest}");
     }
     let dt = start_gen.elapsed();
-    let throughput_per_req = (token_generated - 1) as f64 / dt.as_secs_f64();
     println!(
-        "\n{} tokens generated ({} x {token_generated} tokens), throughput: {:.2} token/s ({} x {:.2} token/s)", token_generated * args.batch_size,
-        args.batch_size, throughput_per_req * args.batch_size as f64, args.batch_size, throughput_per_req
+        "\n\n{} tokens generated ({} token/s)\n",
+        token_generated,
+        (token_generated - 1) as f64 / dt.as_secs_f64(),
     );
     Ok(())
 }

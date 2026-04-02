@@ -75,9 +75,6 @@ struct Flash_fwd_params : public Qkv_params {
     // If provided, the actual length of each k sequence.
     int * __restrict__ seqused_k;
 
-    // If provided, the actual length of each k sequence.
-    int * __restrict__ seqused_k;
-
     int *__restrict__ blockmask;
 
     // The K_new and V_new matrices.
@@ -187,6 +184,6 @@ struct Flash_bwd_params : public Flash_fwd_params {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename T, int Headdim, bool Is_causal> void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
-// template<typename T, int Headdim, bool Is_causal> void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream);
+template<typename T, int Headdim, bool Is_causal> void run_mha_fwd_splitkv_dispatch_(Flash_fwd_params &params, cudaStream_t stream);
 
 // template<typename T, int Headdim, bool Is_causal> void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);

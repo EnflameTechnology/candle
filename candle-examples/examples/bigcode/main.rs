@@ -5,9 +5,9 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use anyhow::{Error as E, Result};
-use candle_transformers::models::bigcode::{Config, GPTBigCode};
 use clap::Parser;
-use std::path::Path;
+
+use candle_transformers::models::bigcode::{Config, GPTBigCode};
 
 use candle::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
@@ -40,7 +40,7 @@ impl TextGeneration {
         }
     }
 
-    fn run(&mut self, prompt: &str, sample_len: usize, batch_size: usize) -> Result<()> {
+    fn run(&mut self, prompt: &str, sample_len: usize) -> Result<()> {
         use std::io::Write;
         println!("starting the inference loop");
         print!("{prompt}");
@@ -53,33 +53,16 @@ impl TextGeneration {
             .to_vec();
 
         let mut new_tokens = vec![];
-        let mut start_gen = std::time::Instant::now();
+        let start_gen = std::time::Instant::now();
         for index in 0..sample_len {
             let (context_size, past_len) = if self.model.config().use_cache && index > 0 {
                 (1, tokens.len().saturating_sub(1))
             } else {
                 (tokens.len(), 0)
             };
-            if index == 1 {
-                start_gen = std::time::Instant::now()
-            }
             let ctxt = &tokens[tokens.len().saturating_sub(context_size)..];
-
-            let input = Tensor::new(ctxt, &self.device)?;
-            let input = if batch_size > 1 {
-                let dims = input.layout().dims();
-                input
-                    .broadcast_as((batch_size, if dims.len() > 1 { dims[1] } else { dims[0] }))?
-                    .contiguous()?
-            } else {
-                input.unsqueeze(0)?
-            };
+            let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
             let logits = self.model.forward(&input, past_len)?;
-            let logits = if batch_size > 1 {
-                logits.narrow(0, 0, 1)?
-            } else {
-                logits
-            };
             let logits = logits.squeeze(0)?.to_dtype(DType::F32)?;
 
             let next_token = self.logits_processor.sample(&logits)?;
@@ -90,10 +73,9 @@ impl TextGeneration {
             std::io::stdout().flush()?;
         }
         let dt = start_gen.elapsed();
-        let throughput_per_req = (sample_len - 1) as f64 / dt.as_secs_f64();
         println!(
-            "\n{} tokens generated ({} x {sample_len} tokens), throughput: {:.2} token/s ({} x {:.2} token/s)", sample_len * batch_size,
-            batch_size, throughput_per_req * batch_size as f64, batch_size, throughput_per_req
+            "{sample_len} tokens generated ({:.3} token/s)",
+            sample_len as f64 / dt.as_secs_f64(),
         );
         Ok(())
     }
@@ -132,10 +114,7 @@ struct Args {
     revision: String,
 
     #[arg(long)]
-    weight_path: Option<String>,
-
-    #[arg(long, default_value_t = 1)]
-    batch_size: usize,
+    weight_file: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -148,14 +127,10 @@ fn main() -> Result<()> {
         RepoType::Model,
         args.revision,
     ));
-    let tokenizer_filename = match &args.weight_path {
-        Some(path) => Path::new(path).join("tokenizer.json"),
-        None => repo.get("tokenizer.json")?,
-    };
-
-    let filenames = match &args.weight_path {
-        Some(path) => vec![Path::new(path).join("model.safetensors")],
-        None => vec!["model.safetensors"]
+    let tokenizer_filename = repo.get("tokenizer.json")?;
+    let filenames = match args.weight_file {
+        Some(weight_file) => vec![std::path::PathBuf::from(weight_file)],
+        None => ["model.safetensors"]
             .iter()
             .map(|f| repo.get(f))
             .collect::<std::result::Result<Vec<_>, _>>()?,
@@ -165,7 +140,7 @@ fn main() -> Result<()> {
 
     let start = std::time::Instant::now();
     let device = candle_examples::device(args.cpu)?;
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, DType::BF16, &device)? };
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, DType::F32, &device)? };
     let config = Config::starcoder_1b();
     let model = GPTBigCode::load(vb, config)?;
     println!("loaded the model in {:?}", start.elapsed());
@@ -178,6 +153,6 @@ fn main() -> Result<()> {
         args.top_p,
         &device,
     );
-    pipeline.run(&args.prompt, args.sample_len, args.batch_size)?;
+    pipeline.run(&args.prompt, args.sample_len)?;
     Ok(())
 }

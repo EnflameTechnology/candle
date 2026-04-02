@@ -55,29 +55,25 @@ struct RotaryEmbedding {
     dim: usize,
     sin: Tensor,
     cos: Tensor,
-    cos_sin: Tensor,
 }
 
 impl RotaryEmbedding {
-    fn new(cfg: &Config, dtype: DType, dev: &Device) -> Result<Self> {
+    fn new(cfg: &Config, dev: &Device) -> Result<Self> {
         let dim = (cfg.partial_rotary_factor * cfg.head_dim() as f64) as usize;
         let inv_freq: Vec<_> = (0..dim)
             .step_by(2)
             .map(|i| 1f32 / cfg.rope_theta.powf(i as f32 / dim as f32))
             .collect();
         let inv_freq_len = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(dtype)?;
+        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?;
         let t = Tensor::arange(0u32, cfg.max_position_embeddings as u32, dev)?
-            .to_dtype(dtype)?
+            .to_dtype(DType::F32)?
             .reshape((cfg.max_position_embeddings, 1))?;
         let freqs = t.matmul(&inv_freq)?;
-        let cos_sin = Tensor::cat(&[&freqs.cos()?, &freqs.sin()?], D::Minus1)?; //must be contiguous tensor;
-        let emb = Tensor::cat(&[&freqs, &freqs], D::Minus1)?;
         Ok(Self {
             dim,
-            sin: emb.sin()?,
-            cos: emb.cos()?,
-            cos_sin,
+            sin: freqs.sin()?,
+            cos: freqs.cos()?,
         })
     }
 
@@ -152,7 +148,7 @@ fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: f32) -> Result<Tensor>
 }
 
 impl Attention {
-    fn new(cfg: &Config, dtype: DType, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads();
         let head_dim = cfg.head_dim();
@@ -161,7 +157,7 @@ impl Attention {
         let v_proj = linear(cfg.hidden_size, num_kv_heads * head_dim, vb.pp("v_proj"))?;
         let dense = linear(num_heads * head_dim, cfg.hidden_size, vb.pp("dense"))?;
         // Alternative rope scalings are not supported.
-        let rotary_emb = RotaryEmbedding::new(cfg, dtype, vb.device())?;
+        let rotary_emb = RotaryEmbedding::new(cfg, vb.device())?;
         let (q_layernorm, k_layernorm) = if cfg.qk_layernorm {
             let q_layernorm = layer_norm(head_dim, cfg.layer_norm_eps, vb.pp("q_layernorm"))?;
             let k_layernorm = layer_norm(head_dim, cfg.layer_norm_eps, vb.pp("k_layernorm"))?;
@@ -207,77 +203,46 @@ impl Attention {
             Some(ln) => key_states.apply(ln)?,
         };
 
-        let (query_states, key_states, value_states) = if seq_len == 1 {
-            //no need transpose for seq_len == 1, change reshape dim
-            let q = query_states.reshape((b_size, self.num_heads, seq_len, self.head_dim))?;
-            let k = key_states.reshape((b_size, self.num_kv_heads, seq_len, self.head_dim))?;
-            let v = value_states.reshape((b_size, self.num_kv_heads, seq_len, self.head_dim))?;
-            (q, k, v)
-        } else {
-            let q = query_states
-                .reshape((b_size, seq_len, self.num_heads, self.head_dim))?
-                .transpose(1, 2)?;
-            let k = key_states
-                .reshape((b_size, seq_len, self.num_kv_heads, self.head_dim))?
-                .transpose(1, 2)?;
-            let v = value_states
-                .reshape((b_size, seq_len, self.num_kv_heads, self.head_dim))?
-                .transpose(1, 2)?;
-            (q, k, v.contiguous()?)
-        };
+        let query_states = query_states
+            .reshape((b_size, seq_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let key_states = key_states
+            .reshape((b_size, seq_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let value_states = value_states
+            .reshape((b_size, seq_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
 
         // Rotary embeddings.
         let seqlen_offset = match &self.kv_cache {
             None => 0,
             Some((prev_k, _)) => prev_k.dim(2)?,
         };
-
-        #[cfg(not(feature = "gcu"))]
-        let (query_states, key_states) = candle_nn::ops::partial_rotary_emb_qkv(
-            &query_states,
-            &key_states,
-            &self.rotary_emb.cos,
-            &self.rotary_emb.sin,
-            seqlen_offset,
-            self.rotary_emb.dim,
-            true,
-        )?;
-
-        #[cfg(feature = "gcu")]
-        let seqlen_offset = Tensor::new(seqlen_offset as i64, &query_states.device())?;
-
-        #[cfg(feature = "gcu")]
-        let (query_states, key_states) = candle_nn::apply_rotary_emb_qkv(
-            &query_states,
-            &key_states,
-            &self.rotary_emb.cos_sin,
-            &self.rotary_emb.sin,
-            &seqlen_offset,
-            self.rotary_emb.dim,
-            true,
-            true,
-        )?;
+        let query_states = self
+            .rotary_emb
+            .apply_rotary_emb(&query_states, seqlen_offset)?;
+        let key_states = self
+            .rotary_emb
+            .apply_rotary_emb(&key_states, seqlen_offset)?;
 
         // KV cache.
         let (key_states, value_states) = match &self.kv_cache {
             None => (key_states, value_states),
             Some((prev_k, prev_v)) => {
-                // let k = Tensor::cat(&[prev_k, &key_states], 2)?;
-                // let v = Tensor::cat(&[prev_v, &value_states], 2)?;
-                let k = candle_nn::kvconcat(prev_k, &key_states, 2)?;
-                let v = candle_nn::kvconcat(prev_v, &value_states, 2)?;
+                let k = Tensor::cat(&[prev_k, &key_states], 2)?;
+                let v = Tensor::cat(&[prev_v, &value_states], 2)?;
                 (k, v)
             }
         };
         self.kv_cache = Some((key_states.clone(), value_states.clone()));
 
         // Repeat kv.
-        let key_states = self.repeat_kv(key_states)?; //.contiguous()?;
-        let value_states = self.repeat_kv(value_states)?; //.contiguous()?;
+        let key_states = self.repeat_kv(key_states)?.contiguous()?;
+        let value_states = self.repeat_kv(value_states)?.contiguous()?;
 
         let attn_weights = (query_states
             .to_dtype(DType::F32)?
-            // .contiguous()?
+            .contiguous()?
             .matmul(&key_states.to_dtype(DType::F32)?.t()?)?
             * self.softmax_scale)?;
         let attn_weights = match mask {
@@ -311,8 +276,8 @@ struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    fn new(cfg: &Config, dtype: DType, vb: VarBuilder) -> Result<Self> {
-        let self_attn = Attention::new(cfg, dtype, vb.pp("self_attn"))?;
+    fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        let self_attn = Attention::new(cfg, vb.pp("self_attn"))?;
         let mlp = MLP::new(cfg, vb.pp("mlp"))?;
         let input_layernorm = layer_norm(
             cfg.hidden_size,
@@ -351,7 +316,7 @@ pub struct Model {
 }
 
 impl Model {
-    pub fn new(cfg: &Config, dtype: DType, vb: VarBuilder) -> Result<Self> {
+    pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let vb_m = vb.pp("model");
         let embed_tokens =
             Embedding::new(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
@@ -363,7 +328,7 @@ impl Model {
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_m = vb_m.pp("layers");
         for layer_idx in 0..cfg.num_hidden_layers {
-            let layer = DecoderLayer::new(cfg, dtype, vb_m.pp(layer_idx))?;
+            let layer = DecoderLayer::new(cfg, vb_m.pp(layer_idx))?;
             layers.push(layer)
         }
         let lm_head = linear(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?;

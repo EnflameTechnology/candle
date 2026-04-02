@@ -12,7 +12,7 @@ pub enum DeviceLocation {
     Metal { gpu_id: usize },
 }
 
-/// Cpu, Cuda, or Metal
+/// Cpu, Cuda, Gcu, or Metal
 #[derive(Debug, Clone)]
 pub enum Device {
     Cpu,
@@ -132,9 +132,11 @@ impl Device {
     pub fn new_cuda(ordinal: usize) -> Result<Self> {
         Ok(Self::Cuda(crate::CudaDevice::new(ordinal)?))
     }
+
     pub fn new_gcu(ordinal: usize) -> Result<Self> {
         Ok(Self::Gcu(crate::GcuDevice::new(ordinal)?))
     }
+
     pub fn as_cuda_device(&self) -> Result<&crate::CudaDevice> {
         match self {
             Self::Cuda(d) => Ok(d),
@@ -143,6 +145,7 @@ impl Device {
             Self::Metal(_) => crate::bail!("expected a cuda device, got Metal"),
         }
     }
+
     pub fn as_gcu_device(&self) -> Result<&crate::GcuDevice> {
         match self {
             Self::Gcu(d) => Ok(d),
@@ -151,6 +154,7 @@ impl Device {
             Self::Metal(_) => crate::bail!("expected a gcu device, got Metal"),
         }
     }
+
     pub fn as_metal_device(&self) -> Result<&crate::MetalDevice> {
         match self {
             Self::Cuda(_) => crate::bail!("expected a metal device, got cuda"),
@@ -172,8 +176,8 @@ impl Device {
         match self {
             Self::Cpu => CpuDevice.set_seed(seed),
             Self::Cuda(c) => c.set_seed(seed),
-            Self::Metal(m) => m.set_seed(seed),
             Self::Gcu(g) => g.set_seed(seed),
+            Self::Metal(m) => m.set_seed(seed),
         }
     }
 
@@ -214,9 +218,7 @@ impl Device {
 
     pub fn supports_bf16(&self) -> bool {
         match self {
-            Self::Cuda(_) => true,
-            Self::Gcu(_) => true,
-            Self::Metal(_) => true,
+            Self::Cuda(_) | Self::Gcu(_) | Self::Metal(_) => true,
             Self::Cpu => false,
         }
     }
@@ -260,13 +262,13 @@ impl Device {
                     Ok(Storage::Cuda(storage))
                 }
             }
-            Device::Metal(device) => {
-                let storage = device.rand_uniform(shape, dtype, lo, up)?;
-                Ok(Storage::Metal(storage))
-            }
             Device::Gcu(device) => {
                 let storage = device.rand_uniform(shape, dtype, lo, up)?;
                 Ok(Storage::Gcu(storage))
+            }
+            Device::Metal(device) => {
+                let storage = device.rand_uniform(shape, dtype, lo, up)?;
+                Ok(Storage::Metal(storage))
             }
         }
     }
@@ -302,13 +304,13 @@ impl Device {
                     Ok(Storage::Cuda(storage))
                 }
             }
-            Device::Metal(device) => {
-                let storage = device.rand_normal(shape, dtype, mean, std)?;
-                Ok(Storage::Metal(storage))
-            }
             Device::Gcu(device) => {
                 let storage = device.rand_normal(shape, dtype, mean, std)?;
                 Ok(Storage::Gcu(storage))
+            }
+            Device::Metal(device) => {
+                let storage = device.rand_normal(shape, dtype, mean, std)?;
+                Ok(Storage::Metal(storage))
             }
         }
     }
@@ -343,14 +345,14 @@ impl Device {
         }
     }
 
-    pub(crate) fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Storage> {
+    pub(crate) fn zeros(&self, shape: &Shape, dtype: DType, sync_alloc: bool) -> Result<Storage> {
         match self {
             Device::Cpu => {
-                let storage = CpuDevice.zeros_impl(shape, dtype)?;
+                let storage = CpuDevice.zeros_impl(shape, dtype, sync_alloc)?;
                 Ok(Storage::Cpu(storage))
             }
             Device::Cuda(device) => {
-                let storage = device.zeros_impl(shape, dtype)?;
+                let storage = device.zeros_impl(shape, dtype, sync_alloc)?;
                 Ok(Storage::Cuda(storage))
             }
             Device::Gcu(device) => {
@@ -358,7 +360,7 @@ impl Device {
                 Ok(Storage::Gcu(storage))
             }
             Device::Metal(device) => {
-                let storage = device.zeros_impl(shape, dtype)?;
+                let storage = device.zeros_impl(shape, dtype, sync_alloc)?;
                 Ok(Storage::Metal(storage))
             }
         }

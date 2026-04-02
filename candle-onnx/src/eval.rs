@@ -1017,6 +1017,7 @@ fn simple_eval_(
                     }
                     rtype => bail!("unsupported 'value' type {rtype:?} for {}", node.name),
                 };
+
                 values.insert(node.output[0].clone(), output);
             }
             // https://github.com/onnx/onnx/blob/main/docs/Operators.md#Cast

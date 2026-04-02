@@ -14,7 +14,7 @@
 //!
 
 use crate::models::with_tracing::{linear, linear_no_bias, Linear};
-use candle::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use candle::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::{Activation, LayerNorm, VarBuilder};
 use serde::Deserialize;
 use std::sync::Arc;
@@ -29,10 +29,10 @@ pub struct Config {
     pub(crate) num_attention_heads: usize,
     pub(crate) num_key_value_heads: usize,
     pub(crate) hidden_act: Activation,
-    pub(crate) rope_pct: f64,
+    pub(crate) partial_rotary_factor: f64,
     pub(crate) rope_theta: f64,
     pub(crate) max_position_embeddings: usize,
-    pub(crate) norm_eps: f64,
+    pub(crate) layer_norm_eps: f64,
     pub(crate) use_cache: bool,
     #[serde(default)]
     pub(crate) use_qkv_bias: bool, // Used in StableLM-2
@@ -50,10 +50,10 @@ impl Config {
             num_attention_heads: 32,
             num_key_value_heads: 32,
             hidden_act: Activation::Silu,
-            rope_pct: 0.25,
+            partial_rotary_factor: 0.25,
             rope_theta: 10_000.,
             max_position_embeddings: 4096,
-            norm_eps: 1e-5,
+            layer_norm_eps: 1e-5,
             use_qkv_bias: false,
             use_cache: true,
             use_flash_attn,
@@ -65,7 +65,7 @@ impl Config {
     }
 
     pub fn rotary_ndims(&self) -> usize {
-        (self.head_dim() as f64 * self.rope_pct) as usize
+        (self.head_dim() as f64 * self.partial_rotary_factor) as usize
     }
 
     pub fn num_kv_groups(&self) -> usize {
@@ -81,7 +81,6 @@ impl Config {
 pub(crate) struct RotaryEmbedding {
     sin: Tensor,
     cos: Tensor,
-    cos_sin: Tensor,
 }
 
 fn rotate_half(xs: &Tensor) -> Result<Tensor> {
@@ -103,12 +102,10 @@ impl RotaryEmbedding {
             .to_dtype(dtype)?
             .reshape((max_seq_len, 1))?;
         let freqs = t.matmul(&inv_freq)?;
-        let cos_sin = Tensor::cat(&[&freqs.cos()?, &freqs.sin()?], D::Minus1)?.contiguous()?; //must be contiguous tensor;
         let freqs = Tensor::cat(&[&freqs, &freqs], D::Minus1)?;
         Ok(Self {
             sin: freqs.sin()?,
             cos: freqs.cos()?,
-            cos_sin,
         })
     }
 
@@ -242,63 +239,38 @@ impl Attention {
         seqlen_offset: usize,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let (b_sz, seq_len, _) = xs.dims3()?;
+        let (b_sz, q_len, _) = xs.dims3()?;
 
         let query_states = self.q_proj.forward(xs)?;
         let key_states = self.k_proj.forward(xs)?;
         let value_states = self.v_proj.forward(xs)?;
 
-        let (query_states, key_states, value_states) = if seq_len == 1 {
-            //no need transpose for seq_len == 1, change reshape dim
-            let q = query_states.reshape((b_sz, self.num_heads, seq_len, self.head_dim))?;
-            let k = key_states.reshape((b_sz, self.num_kv_heads, seq_len, self.head_dim))?;
-            let v = value_states.reshape((b_sz, self.num_kv_heads, seq_len, self.head_dim))?;
-            (q, k, v)
-        } else {
-            let q = query_states
-                .reshape((b_sz, seq_len, self.num_heads, self.head_dim))?
-                .transpose(1, 2)?;
-            let k = key_states
-                .reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?
-                .transpose(1, 2)?;
-            let v = value_states
-                .reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?
-                .transpose(1, 2)?;
-            (q, k, v.contiguous()?)
-        };
+        let query_states = query_states
+            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let key_states = key_states
+            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let value_states = value_states
+            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
 
-        #[cfg(not(feature = "gcu"))]
-        let (query_states, key_states) = candle_nn::ops::partial_rotary_emb_qkv(
-            &query_states,
-            &key_states,
-            &self.rotary_emb.cos,
-            &self.rotary_emb.sin,
-            seqlen_offset,
-            self.rotary_ndims,
-            true,
-        )?;
-
-        #[cfg(feature = "gcu")]
-        let seqlen_offset = Tensor::new(seqlen_offset as i64, &xs.device())?;
-
-        let (query_states, key_states) = candle_nn::apply_rotary_emb_qkv(
-            &query_states,
-            &key_states,
-            &self.rotary_emb.cos_sin,
-            &self.rotary_emb.sin,
-            &seqlen_offset,
-            self.rotary_ndims,
-            true,
-            true,
-        )?;
+        let (rot_ndims, pass_ndims) = (self.rotary_ndims, self.head_dim - self.rotary_ndims);
+        let query_rot = query_states.narrow(D::Minus1, 0, rot_ndims)?;
+        let query_pass = query_states.narrow(D::Minus1, rot_ndims, pass_ndims)?;
+        let key_rot = key_states.narrow(D::Minus1, 0, rot_ndims)?;
+        let key_pass = key_states.narrow(D::Minus1, rot_ndims, pass_ndims)?;
+        let (query_rot, key_rot) =
+            self.rotary_emb
+                .apply_rotary_emb_qkv(&query_rot, &key_rot, seqlen_offset)?;
+        let query_states = Tensor::cat(&[query_rot, query_pass], D::Minus1)?.contiguous()?;
+        let key_states = Tensor::cat(&[key_rot, key_pass], D::Minus1)?.contiguous()?;
 
         let (key_states, value_states) = match &self.kv_cache {
             None => (key_states, value_states),
             Some((prev_k, prev_v)) => {
-                // let key_states = Tensor::cat(&[prev_k, &key_states], 2)?;
-                // let value_states = Tensor::cat(&[prev_v, &value_states], 2)?;
-                let key_states = candle_nn::kvconcat(prev_k, &key_states, 2)?;
-                let value_states = candle_nn::kvconcat(prev_v, &value_states, 2)?;
+                let key_states = Tensor::cat(&[prev_k, &key_states], 2)?;
+                let value_states = Tensor::cat(&[prev_v, &value_states], 2)?;
                 (key_states, value_states)
             }
         };
@@ -306,8 +278,9 @@ impl Attention {
             self.kv_cache = Some((key_states.clone(), value_states.clone()));
         }
 
-        let key_states = crate::utils::repeat_kv(key_states, self.num_kv_groups)?; //.contiguous()?;
-        let value_states = crate::utils::repeat_kv(value_states, self.num_kv_groups)?; //.contiguous()?;
+        let key_states = crate::utils::repeat_kv(key_states, self.num_kv_groups)?.contiguous()?;
+        let value_states =
+            crate::utils::repeat_kv(value_states, self.num_kv_groups)?.contiguous()?;
 
         let attn_output = if self.use_flash_attn {
             // flash-attn expects (b_sz, seq_len, nheads, head_dim)
@@ -315,7 +288,7 @@ impl Attention {
             let k = key_states.transpose(1, 2)?;
             let v = value_states.transpose(1, 2)?;
             let softmax_scale = 1f32 / (self.head_dim as f32).sqrt();
-            flash_attn(&q, &k, &v, softmax_scale, seq_len > 1)?.transpose(1, 2)?
+            flash_attn(&q, &k, &v, softmax_scale, q_len > 1)?.transpose(1, 2)?
         } else {
             let scale = 1f64 / f64::sqrt(self.head_dim as f64);
             let attn_weights = (query_states.matmul(&key_states.transpose(2, 3)?)? * scale)?;
@@ -329,7 +302,7 @@ impl Attention {
         };
         attn_output
             .transpose(1, 2)?
-            .reshape((b_sz, seq_len, self.hidden_size))?
+            .reshape((b_sz, q_len, self.hidden_size))?
             .apply(&self.o_proj)
     }
 }
@@ -347,11 +320,14 @@ impl DecoderLayer {
     fn new(rotary_emb: Arc<RotaryEmbedding>, cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let self_attn = Attention::new(rotary_emb, cfg, vb.pp("self_attn"))?;
         let mlp = MLP::new(cfg, vb.pp("mlp"))?;
-        let input_layernorm =
-            candle_nn::layer_norm(cfg.hidden_size, cfg.norm_eps, vb.pp("input_layernorm"))?;
+        let input_layernorm = candle_nn::layer_norm(
+            cfg.hidden_size,
+            cfg.layer_norm_eps,
+            vb.pp("input_layernorm"),
+        )?;
         let post_attention_layernorm = candle_nn::layer_norm(
             cfg.hidden_size,
-            cfg.norm_eps,
+            cfg.layer_norm_eps,
             vb.pp("post_attention_layernorm"),
         )?;
         Ok(Self {
@@ -403,7 +379,7 @@ impl Model {
             let layer = DecoderLayer::new(rotary_emb.clone(), cfg, vb_l.pp(layer_idx))?;
             layers.push(layer)
         }
-        let norm = candle_nn::layer_norm(cfg.hidden_size, cfg.norm_eps, vb_m.pp("norm"))?;
+        let norm = candle_nn::layer_norm(cfg.hidden_size, cfg.layer_norm_eps, vb_m.pp("norm"))?;
         let lm_head = linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?;
         Ok(Self {
             embed_tokens,
@@ -450,7 +426,7 @@ impl Model {
         for layer in self.layers.iter_mut() {
             xs = layer.forward(&xs, attention_mask.as_ref(), seqlen_offset)?
         }
-        xs.i((.., seq_len - 1, ..))?
+        xs.narrow(1, seq_len - 1, 1)?
             .apply(&self.norm)?
             .apply(&self.lm_head)
     }

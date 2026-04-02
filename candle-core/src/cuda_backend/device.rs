@@ -51,27 +51,6 @@ impl CudaDevice {
         self.device.clone()
     }
 
-    pub fn compile(
-        &self,
-        func_name: &'static str,
-        kernel: ug::lang::ssa::Kernel,
-    ) -> Result<CudaFunction> {
-        let mut buf = vec![];
-        ug_cuda::code_gen::gen(&mut buf, func_name, &kernel)?;
-        let cuda_code = String::from_utf8(buf)?;
-        let opts = cudarc::nvrtc::CompileOptions {
-            use_fast_math: Some(true),
-            ..Default::default()
-        };
-        let ptx = cudarc::nvrtc::safe::compile_ptx_with_opts(cuda_code, opts).w()?;
-        self.device.load_ptx(ptx, "ug", &[func_name]).w()?;
-        let func = match self.device.get_func("ug", func_name) {
-            Some(func) => func,
-            None => crate::bail!("unknown function ug::{func_name}"),
-        };
-        Ok(func)
-    }
-
     pub fn id(&self) -> DeviceId {
         self.id
     }
@@ -212,35 +191,35 @@ impl BackendDevice for CudaDevice {
         self.id == rhs.id
     }
 
-    fn zeros_impl(&self, shape: &Shape, dtype: DType) -> Result<CudaStorage> {
+    fn zeros_impl(&self, shape: &Shape, dtype: DType, sync_alloc: bool) -> Result<CudaStorage> {
         let elem_count = shape.elem_count();
         let slice = match dtype {
             DType::U8 => {
-                let data = self.alloc_zeros::<u8>(elem_count).w()?;
+                let data = self.alloc_zeros::<u8>(elem_count, sync_alloc).w()?;
                 CudaStorageSlice::U8(data)
             }
             DType::U32 => {
-                let data = self.alloc_zeros::<u32>(elem_count).w()?;
+                let data = self.alloc_zeros::<u32>(elem_count, sync_alloc).w()?;
                 CudaStorageSlice::U32(data)
             }
             DType::I64 => {
-                let data = self.alloc_zeros::<i64>(elem_count).w()?;
+                let data = self.alloc_zeros::<i64>(elem_count, sync_alloc).w()?;
                 CudaStorageSlice::I64(data)
             }
             DType::BF16 => {
-                let data = self.alloc_zeros::<bf16>(elem_count).w()?;
+                let data = self.alloc_zeros::<bf16>(elem_count, sync_alloc).w()?;
                 CudaStorageSlice::BF16(data)
             }
             DType::F16 => {
-                let data = self.alloc_zeros::<f16>(elem_count).w()?;
+                let data = self.alloc_zeros::<f16>(elem_count, sync_alloc).w()?;
                 CudaStorageSlice::F16(data)
             }
             DType::F32 => {
-                let data = self.alloc_zeros::<f32>(elem_count).w()?;
+                let data = self.alloc_zeros::<f32>(elem_count, sync_alloc).w()?;
                 CudaStorageSlice::F32(data)
             }
             DType::F64 => {
-                let data = self.alloc_zeros::<f64>(elem_count).w()?;
+                let data = self.alloc_zeros::<f64>(elem_count, sync_alloc).w()?;
                 CudaStorageSlice::F64(data)
             }
         };

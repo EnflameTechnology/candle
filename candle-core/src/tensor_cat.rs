@@ -1,4 +1,4 @@
-use crate::{shape::Dim, Error, Result, Shape, Tensor};
+use crate::{shape::Dim, Context, Error, Result, Shape, Tensor};
 
 impl Tensor {
     /// Concatenates two or more tensors along a particular dimension.
@@ -58,19 +58,18 @@ impl Tensor {
                 }
             }
         }
-        // let all_contiguous = args.iter().all(|v| v.as_ref().is_contiguous());
-        // if all_contiguous {
-        //     Self::cat_contiguous(args, dim)
-        // } else
-        if dim == 0 {
+        let all_contiguous = args.iter().all(|v| v.as_ref().is_contiguous());
+        if all_contiguous {
+            Self::cat_contiguous(args, dim)
+        } else if dim == 0 {
             Self::cat0(args)
         } else {
             let args: Vec<Tensor> = args
                 .iter()
-                .map(|a| a.as_ref().transpose(0, dim)?.contiguous())
+                .map(|a| a.as_ref().transpose(0, dim))
                 .collect::<Result<Vec<_>>>()?;
             let cat = Self::cat0(&args)?;
-            cat.transpose(0, dim)?.contiguous()
+            cat.transpose(0, dim)
         }
     }
 
@@ -135,7 +134,7 @@ impl Tensor {
                     .bt())?
                 }
             }
-            let next_offset = offsets.last().unwrap() + arg.elem_count();
+            let next_offset = offsets.last().context("empty offsets")? + arg.elem_count();
             offsets.push(next_offset);
         }
         let shape = Shape::from(cat_dims);
@@ -248,6 +247,9 @@ impl Tensor {
         let dim = dim.to_index(self.shape(), "slice-set")?;
         if !self.is_contiguous() || !src.is_contiguous() {
             Err(Error::RequiresContiguous { op: "slice-set" }.bt())?
+        }
+        if self.same_storage(src) {
+            crate::bail!("cannot use slice_set when self and src share their storage")
         }
         if self.dtype() != src.dtype() {
             Err(Error::DTypeMismatchBinaryOp {

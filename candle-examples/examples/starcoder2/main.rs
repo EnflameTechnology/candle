@@ -5,9 +5,9 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use anyhow::{Error as E, Result};
-use candle_transformers::models::starcoder2::Model;
 use clap::Parser;
-use std::path::Path;
+
+use candle_transformers::models::starcoder2::Model;
 
 use candle::{DType, Device, Tensor};
 use candle_examples::token_output_stream::TokenOutputStream;
@@ -153,7 +153,13 @@ struct Args {
     revision: String,
 
     #[arg(long)]
-    weight_path: Option<String>,
+    config_file: Option<String>,
+
+    #[arg(long)]
+    tokenizer_file: Option<String>,
+
+    #[arg(long)]
+    weight_files: Option<String>,
 
     /// Penalty to be applied for repeating tokens, 1. means no penalty.
     #[arg(long, default_value_t = 1.1)]
@@ -201,18 +207,19 @@ fn main() -> Result<()> {
         RepoType::Model,
         args.revision,
     ));
-    let config_file = match &args.weight_path {
-        Some(path) => Path::new(path).join("config.json"),
+    let config_file = match args.config_file {
+        Some(file) => std::path::PathBuf::from(file),
         None => repo.get("config.json")?,
     };
-    let tokenizer_file = match &args.weight_path {
-        Some(path) => Path::new(path).join("tokenizer.json"),
+    let tokenizer_file = match args.tokenizer_file {
+        Some(file) => std::path::PathBuf::from(file),
         None => repo.get("tokenizer.json")?,
     };
-    let filenames = match &args.weight_path {
-        Some(path) => {
-            candle_examples::hub_load_local_safetensors(path, "model.safetensors.index.json")?
-        }
+    let filenames = match args.weight_files {
+        Some(files) => files
+            .split(',')
+            .map(std::path::PathBuf::from)
+            .collect::<Vec<_>>(),
         None => vec![repo.get("model.safetensors")?],
     };
     println!("retrieved the files in {:?}", start.elapsed());

@@ -1,6 +1,6 @@
 [package]
 name = "candle-flash-attn"
-version = "0.8.1"
+version = "0.8.3"
 edition = "2021"
 
 description = "Flash attention layer for the candle ML framework."
@@ -9,16 +9,22 @@ keywords = ["blas", "tensor", "machine-learning"]
 categories = ["science"]
 license = "MIT OR Apache-2.0"
 readme = "README.md"
+exclude = ["cutlass/docs/**", "cutlass/test/**", "cutlass/examples/**", "cutlass/tools/**", "cutlass/media/**"]
 
 [dependencies]
-candle = { path = "../candle-core", features = ["cuda"], package = "candle-core", version = "0.8.1" }
+candle = { path = "../candle-core", features = ["cuda"], package = "candle-core", version = "0.8.3" }
 half = { version = "2.3.1", features = ["num-traits"] }
+once_cell = "1.21.3"
 
 [build-dependencies]
-bindgen_cuda = "0.1.1"
+cudaforge = "0.1.5"
 anyhow = { version = "1", features = ["backtrace"] }
 
 
 [dev-dependencies]
 anyhow = { version = "1", features = ["backtrace"] }
 candle-nn = { path = "../candle-nn", features = ["cuda"] }
+
+[features]
+flash-decoding = []
+flash-context = []

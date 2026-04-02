@@ -172,13 +172,13 @@ pub enum Error {
     #[error(transparent)]
     Cuda(Box<dyn std::error::Error + Send + Sync>),
 
-    // === Wrapped Errors ===
     #[error(transparent)]
     Gcu(Box<dyn std::error::Error + Send + Sync>),
 
     #[error("Metal error {0}")]
     Metal(#[from] MetalError),
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[error(transparent)]
     Ug(#[from] ug::Error),
 

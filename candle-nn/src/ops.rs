@@ -3,7 +3,7 @@
 
 #[cfg(feature = "gcu")]
 use candle::GcuStorage;
-use candle::{CpuStorage, DType, Layout, Result, Shape, Tensor, D};
+use candle::{CpuStorage, DType, Layout, Module, Result, Shape, Tensor, D};
 use rayon::prelude::*;
 
 /// Applies the softmax function to the input tensor, rescaling the element so that elements on
@@ -464,7 +464,6 @@ impl candle::CustomOp1 for SoftmaxLastDim {
                 };
                 let el = layout.shape().elem_count();
                 let dims = layout.shape().dims();
-                // println!("dims: {:?}", dims);
 
                 let dim_m1 = dims[dims.len() - 1];
                 let (batch, chunks, last_dim_size) = if dims.len() == 1 {
@@ -472,7 +471,6 @@ impl candle::CustomOp1 for SoftmaxLastDim {
                 } else {
                     (dims[0], el / dims[0] / dim_m1, dim_m1)
                 };
-                // println!("n_rows: {}, n_cols: {}", n_rows, n_cols);
                 let mut cfg = dev.launch_cfg.clone();
                 cfg.set_shared_memory(src.num_bytes() as u32 + 512 * 1024);
                 let src = &src.slice(layout.start_offset()..);
@@ -502,34 +500,6 @@ impl candle::CustomOp1 for SoftmaxLastDim {
 
 pub fn softmax_last_dim(xs: &Tensor) -> Result<Tensor> {
     xs.apply_op1_no_bwd(&SoftmaxLastDim)
-}
-
-#[cfg(not(feature = "cuda"))]
-pub fn rms_norm(x: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
-    let x_dtype = x.dtype();
-    let internal_dtype = match x_dtype {
-        DType::F16 | DType::BF16 => DType::F32,
-        d => d,
-    };
-    let hidden_size = x.dim(candle::D::Minus1)?;
-    let x = x.to_dtype(internal_dtype)?;
-    let norm_x = (x.sqr()?.sum_keepdim(candle::D::Minus1)? / hidden_size as f64)?;
-    let x_normed = x.broadcast_div(&(norm_x + eps as f64)?.sqrt()?)?;
-    x_normed.to_dtype(x_dtype)?.broadcast_mul(alpha)
-}
-
-#[cfg(feature = "cuda")]
-pub fn rms_norm(xs: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
-    let hidden_size_xs = xs.dim(candle::D::Minus1)?;
-    let hidden_size_alpha = alpha.dims1()?;
-    if hidden_size_xs != hidden_size_alpha {
-        candle::bail!(
-            "shape mismatch in rms-norm {:?} {:?}",
-            xs.shape(),
-            alpha.shape()
-        )
-    }
-    xs.apply_op2_no_bwd(alpha, &RmsNorm { eps })
 }
 
 #[derive(Debug, Clone)]
@@ -736,7 +706,6 @@ pub fn rms_norm_slow(x: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
     x_normed.to_dtype(x_dtype)?.broadcast_mul(alpha)
 }
 
-#[cfg(feature = "cuda")]
 pub fn rms_norm(xs: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
     let hidden_size_xs = xs.dim(D::Minus1)?;
     let hidden_size_alpha = alpha.dims1()?;
@@ -750,13 +719,11 @@ pub fn rms_norm(xs: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
     xs.apply_op2_no_bwd(alpha, &RmsNorm { eps })
 }
 
-#[cfg(not(feature = "gcu"))]
 #[derive(Debug, Clone)]
 struct LayerNorm {
     eps: f32,
 }
 
-#[cfg(not(feature = "gcu"))]
 impl candle::CustomOp3 for LayerNorm {
     fn name(&self) -> &'static str {
         "layer-norm"
@@ -994,7 +961,6 @@ pub fn layer_norm_slow(x: &Tensor, alpha: &Tensor, beta: &Tensor, eps: f32) -> R
         .broadcast_add(beta)
 }
 
-#[cfg(not(feature = "gcu"))]
 pub fn layer_norm(xs: &Tensor, alpha: &Tensor, beta: &Tensor, eps: f32) -> Result<Tensor> {
     let hidden_size_xs = xs.dim(D::Minus1)?;
     let hidden_size_alpha = alpha.dims1()?;
@@ -1290,6 +1256,9 @@ pub fn elu(xs: &Tensor, alpha: f64) -> Result<Tensor> {
 #[derive(Clone, Debug)]
 pub struct Identity;
 
+#[derive(Clone, Debug)]
+pub struct Identity;
+
 impl Identity {
     pub fn new() -> Identity {
         Self
@@ -1302,7 +1271,7 @@ impl Default for Identity {
     }
 }
 
-impl crate::Module for Identity {
+impl Module for Identity {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         Ok(xs.clone())
     }
@@ -1444,27 +1413,80 @@ impl candle::CustomOp3 for Sdpa {
 
         let command_buffer = q.device().command_buffer()?;
         if supports_sdpa_vector {
-            command_buffer.set_label("vector_attention");
-            candle_metal_kernels::call_sdpa_vector(
-                q.device().device(),
-                &command_buffer,
-                q.device().kernels(),
-                q_l.start_offset(),
-                q_l.dims(),
-                q.buffer(),
-                k_l.start_offset(),
-                k_l.dims(),
-                k_l.stride(),
-                k.buffer(),
-                v_l.start_offset(),
-                v_l.stride(),
-                v.buffer(),
-                &output,
-                self.scale,
-                self.softcapping,
-                itype,
-            )
-            .map_err(candle::Error::wrap)?;
+            // Route to the 2 pass fused attention if the k seqlen is large.
+            // https://github.com/ml-explore/mlx/pull/1597
+            const TWO_PASS_K_THRESHOLD: usize = 1024;
+            if k_l.dim(2)? >= TWO_PASS_K_THRESHOLD {
+                let mut intermediate_shape = [
+                    &out_dims[0..out_dims.len() - 2],
+                    &[candle_metal_kernels::SDPA_2PASS_BLOCKS],
+                    &[out_dims[out_dims.len() - 1]],
+                ]
+                .concat();
+                let intermediate = device.new_buffer(
+                    intermediate_shape.iter().product::<usize>(),
+                    DType::F32,
+                    "sdpa_2pass_intermediate",
+                )?;
+                let _ = intermediate_shape.pop().unwrap();
+                let sums = device.new_buffer(
+                    intermediate_shape.iter().product::<usize>(),
+                    DType::F32,
+                    "sdpa_2pass_sums",
+                )?;
+                let maxs = device.new_buffer(
+                    intermediate_shape.iter().product::<usize>(),
+                    DType::F32,
+                    "sdpa_2pass_maxs",
+                )?;
+
+                command_buffer.set_label("vector_attention");
+                candle_metal_kernels::call_sdpa_vector_2pass(
+                    q.device().device(),
+                    &command_buffer,
+                    q.device().kernels(),
+                    q_l.start_offset(),
+                    q_l.dims(),
+                    q.buffer(),
+                    k_l.start_offset(),
+                    k_l.dims(),
+                    k_l.stride(),
+                    k.buffer(),
+                    v_l.start_offset(),
+                    v_l.stride(),
+                    v.buffer(),
+                    &output,
+                    &intermediate,
+                    &sums,
+                    &maxs,
+                    self.scale,
+                    self.softcapping,
+                    itype,
+                )
+                .map_err(candle::Error::wrap)?;
+            } else {
+                command_buffer.set_label("vector_attention");
+                candle_metal_kernels::call_sdpa_vector(
+                    q.device().device(),
+                    &command_buffer,
+                    q.device().kernels(),
+                    q_l.start_offset(),
+                    q_l.dims(),
+                    q.buffer(),
+                    k_l.start_offset(),
+                    k_l.dims(),
+                    k_l.stride(),
+                    k.buffer(),
+                    v_l.start_offset(),
+                    v_l.stride(),
+                    v.buffer(),
+                    &output,
+                    self.scale,
+                    self.softcapping,
+                    itype,
+                )
+                .map_err(candle::Error::wrap)?;
+            }
         } else if supports_sdpa_full {
             if q_l.dim(2)? != k_l.dim(2)? {
                 candle::bail!(
@@ -1536,7 +1558,6 @@ pub use candle::cuda_backend::cudarc::nccl::safe::{Comm, ReduceOp};
 #[cfg(feature = "eccl")]
 pub use candle::gcu_backend::ubridge::eccl::{Comm, Id, ReduceOp};
 use candle::CustomOp1;
-use candle::Module;
 pub use std::rc::Rc;
 
 #[cfg(all(not(feature = "nccl"), not(feature = "eccl")))]
@@ -2633,4 +2654,151 @@ pub fn indexed_moe(input: &Tensor, weight: &Tensor, indices: &Tensor) -> Result<
             candle::bail!("indexed_moe is only supported for f16 and bf16 ({dt:?})")
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct MXFP4Dequant {
+    out_dtype: DType,
+    group_size: usize,
+}
+
+impl MXFP4Dequant {
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd_t<
+        T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
+    >(
+        &self,
+        s1: &candle::CudaStorage,
+        l1: &Layout, // weight
+        s2: &candle::CudaStorage,
+        l2: &Layout, // scales
+    ) -> Result<(candle::CudaStorage, Shape)> {
+        use candle::backend::BackendStorage;
+        use candle::cuda_backend::cudarc::driver::{LaunchAsync, LaunchConfig};
+        use candle::cuda_backend::{kernels, WrapErr};
+
+        let dev = s1.device();
+        let dims = l1.shape().dims();
+
+        // Flatten leading dimensions to get a 2D-like view for the kernel
+        let num_rows: usize = dims[..dims.len() - 1].iter().product();
+        let packed_row_len = dims[dims.len() - 1];
+        let weights_per_row = packed_row_len * 2; // 2 values per byte
+        let total_elements = num_rows * weights_per_row;
+        // println!("dims {:?}, num_rows {num_rows}, packed_row_len {packed_row_len}, weights_per_row {weights_per_row}", dims);
+
+        let kernel_name = match self.out_dtype {
+            DType::F32 => "dequantize_mxfp4_f32",
+            DType::F16 => "dequantize_mxfp4_f16",
+            DType::BF16 => "dequantize_mxfp4_bf16",
+            _ => candle::bail!("unsupported mxfp4-dequant output type {:?}", self.out_dtype),
+        };
+
+        // Allocate destination buffer
+        let dst = unsafe { dev.alloc::<T>(total_elements).w()? };
+
+        let groups_per_row = weights_per_row / self.group_size;
+        let threads_per_block = 256;
+        let blocks_per_grid = (total_elements + threads_per_block - 1) / threads_per_block;
+        // println!("groups_per_row {groups_per_row}, threads_per_block {threads_per_block}, blocks_per_grid {blocks_per_grid}");
+
+        let cfg = LaunchConfig {
+            grid_dim: (blocks_per_grid as u32, 1, 1),
+            block_dim: (threads_per_block as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let func = dev.get_or_load_func(kernel_name, kernels::QUANTIZED)?;
+
+        let src_full = s1.as_cuda_slice::<u8>()?;
+        let scale_full = s2.as_cuda_slice::<u8>()?;
+
+        let src = src_full.slice(l1.start_offset()..);
+        let scale = scale_full.slice(l2.start_offset()..);
+
+        let params = (
+            &dst,
+            &src,
+            &scale,
+            total_elements as i64,
+            weights_per_row as i32,
+            packed_row_len as i32,
+            groups_per_row as i32,
+            self.group_size as i32,
+        );
+
+        unsafe { func.launch(cfg, params) }.w()?;
+
+        // Reconstruct the output shape
+        let rank = dims.len();
+        let mut out_dims = dims.to_vec();
+        out_dims[rank - 1] = weights_per_row;
+        // println!("out shape {:?}", out_dims);
+
+        let dst_storage = candle::CudaStorage::wrap_cuda_slice(dst, dev.clone());
+        // dev.synchronize();
+
+        Ok((dst_storage, out_dims.into()))
+    }
+}
+
+impl candle::CustomOp2 for MXFP4Dequant {
+    fn name(&self) -> &'static str {
+        "mxfp4-dequant"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        candle::bail!("MXFP4Dequant has no cpu impl")
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        s1: &candle::CudaStorage,
+        l1: &Layout, //weight
+        s2: &candle::CudaStorage,
+        l2: &Layout, //scales
+    ) -> Result<(candle::CudaStorage, Shape)> {
+        use half::{bf16, f16};
+        match self.out_dtype {
+            candle::DType::F16 => self.cuda_fwd_t::<f16>(s1, l1, s2, l2),
+            candle::DType::BF16 => self.cuda_fwd_t::<bf16>(s1, l1, s2, l2),
+            candle::DType::F32 => self.cuda_fwd_t::<f32>(s1, l1, s2, l2),
+            dt => candle::bail!("flash-attn is only supported for f16/bf16 ({dt:?})"),
+        }
+    }
+}
+pub fn dequant_mxfp4(
+    weight: &Tensor,
+    scales: &Tensor,
+    out_dtype: DType,
+    group_size: usize,
+) -> Result<Tensor> {
+    if !weight.is_contiguous() {
+        candle::bail!("weight must be contiguous");
+    }
+    if !scales.is_contiguous() {
+        candle::bail!("scales must be contiguous");
+    }
+    if weight.dtype() != DType::U8 {
+        candle::bail!("weight must be u8");
+    }
+    if scales.dtype() != DType::U8 {
+        candle::bail!("scales must be u8");
+    }
+    if group_size % 32 != 0 {
+        candle::bail!("group size must be a multiple of 32");
+    }
+    weight.apply_op2_no_bwd(
+        scales,
+        &MXFP4Dequant {
+            out_dtype,
+            group_size,
+        },
+    )
 }

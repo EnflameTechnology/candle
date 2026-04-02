@@ -33,12 +33,6 @@ pub fn repeat_kv(xs: Tensor, n_rep: usize) -> Result<Tensor> {
         // Using cat is faster than a broadcast as it avoids going through a potentially
         // strided copy.
         // https://github.com/huggingface/candle/pull/2043
-        if xs.device().is_gcu() {
-            xs.unsqueeze(2)?
-                .expand((b_sz, n_kv_head, n_rep, seq_len, head_dim))?
-                .reshape((b_sz, n_kv_head * n_rep, seq_len, head_dim))
-        } else {
-            Tensor::cat(&vec![&xs; n_rep], 2)?.reshape((b_sz, n_kv_head * n_rep, seq_len, head_dim))
-        }
+        Tensor::cat(&vec![&xs; n_rep], 2)?.reshape((b_sz, n_kv_head * n_rep, seq_len, head_dim))
     }
 }

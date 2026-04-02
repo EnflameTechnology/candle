@@ -489,7 +489,12 @@ fn rotate_half(xs: &Tensor) -> Result<Tensor> {
     Tensor::cat(&[&xs2.neg()?, &xs1], D::Minus1)
 }
 
-pub fn rope_slow(x: &Tensor, cos: &Tensor, sin: &Tensor, index_pos: usize) -> Result<Tensor> {
+pub fn rope_slow(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    rope_slow_at(x, cos, sin, 0)
+}
+
+/// Like [`rope_slow`], but starts cos/sin at `index_pos` along the sequence dimension (GCU / custom attention).
+pub fn rope_slow_at(x: &Tensor, cos: &Tensor, sin: &Tensor, index_pos: usize) -> Result<Tensor> {
     let (_b_sz, _h, seq_len, _n_embd) = x.dims4()?;
     let cos = Tensor::cat(&[cos, cos], D::Minus1)?;
     let sin = Tensor::cat(&[sin, sin], D::Minus1)?;

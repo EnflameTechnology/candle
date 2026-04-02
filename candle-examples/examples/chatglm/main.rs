@@ -5,9 +5,9 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use anyhow::{Error as E, Result};
-use candle_transformers::models::chatglm::{Config, Model};
 use clap::Parser;
-use std::path::Path;
+
+use candle_transformers::models::chatglm::{Config, Model};
 
 use candle::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
@@ -71,12 +71,9 @@ impl TextGeneration {
         };
         print!("{prompt}");
         std::io::stdout().flush()?;
-        let mut start_gen = std::time::Instant::now();
+        let start_gen = std::time::Instant::now();
         for index in 0..sample_len {
             let context_size = if index > 0 { 1 } else { tokens.len() };
-            if index == 1 {
-                start_gen = std::time::Instant::now()
-            }
             let ctxt = &tokens[tokens.len().saturating_sub(context_size)..];
             let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
             let logits = self.model.forward(&input)?;
@@ -105,7 +102,7 @@ impl TextGeneration {
         let dt = start_gen.elapsed();
         println!(
             "\n{generated_tokens} tokens generated ({:.2} token/s)",
-            (generated_tokens - 1) as f64 / dt.as_secs_f64(),
+            generated_tokens as f64 / dt.as_secs_f64(),
         );
         Ok(())
     }
@@ -152,7 +149,10 @@ struct Args {
     revision: Option<String>,
 
     #[arg(long)]
-    weight_path: Option<String>,
+    weight_file: Option<String>,
+
+    #[arg(long)]
+    tokenizer: Option<String>,
 
     /// Penalty to be applied for repeating tokens, 1. means no penalty.
     #[arg(long, default_value_t = 1.1)]
@@ -161,8 +161,6 @@ struct Args {
     /// The context size to consider for the repeat penalty.
     #[arg(long, default_value_t = 64)]
     repeat_last_n: usize,
-    // #[arg(long, default_value_t = 1)] #TODO batch_size > 1
-    // batch_size: usize,
 }
 
 fn main() -> Result<()> {
@@ -202,13 +200,14 @@ fn main() -> Result<()> {
         None => "main".to_string(),
     };
     let repo = api.repo(Repo::with_revision(model_id, RepoType::Model, revision));
-    let tokenizer_filename = api
-        .model("lmz/candle-chatglm".to_string())
-        .get("chatglm-tokenizer.json")?;
-    let filenames = match &args.weight_path {
-        Some(path) => {
-            candle_examples::hub_load_local_safetensors(path, "model.safetensors.index.json")?
-        }
+    let tokenizer_filename = match args.tokenizer {
+        Some(file) => std::path::PathBuf::from(file),
+        None => api
+            .model("lmz/candle-chatglm".to_string())
+            .get("chatglm-tokenizer.json")?,
+    };
+    let filenames = match args.weight_file {
+        Some(weight_file) => vec![std::path::PathBuf::from(weight_file)],
         None => candle_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?,
     };
     println!("retrieved the files in {:?}", start.elapsed());
@@ -217,7 +216,7 @@ fn main() -> Result<()> {
     let start = std::time::Instant::now();
     let config = Config::glm3_6b();
     let device = candle_examples::device(args.cpu)?;
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, DType::BF16, &device)? };
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, DType::F32, &device)? };
     let model = Model::new(&config, vb)?;
 
     println!("loaded the model in {:?}", start.elapsed());

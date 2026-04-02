@@ -41,13 +41,12 @@ impl Linear {
 
 impl super::Module for Linear {
     fn forward(&self, x: &Tensor) -> candle::Result<Tensor> {
-        let x = match *x.dims() {
-            [b1, b2, _, _] => x.matmul(&self.weight.broadcast_left((b1, b2))?.t()?)?,
-            [bsize, _, _] => x.matmul(&self.weight.broadcast_left(bsize)?.t()?)?,
-            _ => x.matmul(&self.weight.t()?)?,
+        let w = match *x.dims() {
+            [b1, b2, _, _] => self.weight.broadcast_left((b1, b2))?.t()?,
+            [bsize, _, _] => self.weight.broadcast_left(bsize)?.t()?,
+            _ => self.weight.t()?,
         };
-
-        // let x = x.matmul(&w)?;
+        let x = x.matmul(&w)?;
         match &self.bias {
             None => Ok(x),
             Some(bias) => x.broadcast_add(bias),

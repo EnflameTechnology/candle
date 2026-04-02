@@ -190,9 +190,7 @@ pub trait UnaryOpT {
     fn f32(v1: f32) -> f32;
     fn f64(v1: f64) -> f64;
     fn u8(v1: u8) -> u8;
-    fn i8(v1: i8) -> i8;
     fn u32(v1: u32) -> u32;
-    fn i32(v1: i32) -> i32;
     fn i64(v1: i64) -> i64;
 
     // There is no very good way to represent optional function in traits so we go for an explicit
@@ -216,9 +214,7 @@ pub trait BinaryOpT {
     fn f32(v1: f32, v2: f32) -> f32;
     fn f64(v1: f64, v2: f64) -> f64;
     fn u8(v1: u8, v2: u8) -> u8;
-    fn i8(v1: i8, v2: i8) -> i8;
     fn u32(v1: u32, v2: u32) -> u32;
-    fn i32(v1: i32, v2: i32) -> i32;
     fn i64(v1: i64, v2: i64) -> i64;
 
     const BF16_VEC: bool = false;
@@ -233,8 +229,6 @@ pub trait BinaryOpT {
     fn u8_vec(_xs1: &[u8], _xs2: &[u8], _ys: &mut [u8]) {}
     const U32_VEC: bool = false;
     fn u32_vec(_xs1: &[u32], _xs2: &[u32], _ys: &mut [u32]) {}
-    const I32_VEC: bool = false;
-    fn i32_vec(_xs1: &[i32], _xs2: &[i32], _ys: &mut [i32]) {}
     const I64_VEC: bool = false;
     fn i64_vec(_xs1: &[i64], _xs2: &[i64], _ys: &mut [i64]) {}
 }
@@ -292,15 +286,7 @@ macro_rules! bin_op {
                 $e(v1, v2)
             }
             #[inline(always)]
-            fn i8(v1: i8, v2: i8) -> i8 {
-                $e(v1, v2)
-            }
-            #[inline(always)]
             fn u32(v1: u32, v2: u32) -> u32 {
-                $e(v1, v2)
-            }
-            #[inline(always)]
-            fn i32(v1: i32, v2: i32) -> i32 {
                 $e(v1, v2)
             }
             #[inline(always)]
@@ -388,16 +374,8 @@ macro_rules! unary_op {
                 todo!("no unary function for u8")
             }
             #[inline(always)]
-            fn i8(_: i8) -> i8 {
-                todo!("no unary function for i8")
-            }
-            #[inline(always)]
             fn u32(_: u32) -> u32 {
                 todo!("no unary function for u32")
-            }
-            #[inline(always)]
-            fn i32(_: i32) -> i32 {
-                todo!("no unary function for i32")
             }
             #[inline(always)]
             fn i64(_: i64) -> i64 {
@@ -432,16 +410,8 @@ macro_rules! unary_op {
                 todo!("no unary function for u8")
             }
             #[inline(always)]
-            fn i8(_: i8) -> i8 {
-                todo!("no unary function for i8")
-            }
-            #[inline(always)]
             fn u32(_: u32) -> u32 {
                 todo!("no unary function for u32")
-            }
-            #[inline(always)]
-            fn i32(_: i32) -> i32 {
-                todo!("no unary function for i32")
             }
             #[inline(always)]
             fn i64(_: i64) -> i64 {
@@ -539,15 +509,7 @@ impl UnaryOpT for Gelu {
         0
     }
     #[inline(always)]
-    fn i8(_: i8) -> i8 {
-        0
-    }
-    #[inline(always)]
     fn u32(_: u32) -> u32 {
-        0
-    }
-    #[inline(always)]
-    fn i32(_: i32) -> i32 {
         0
     }
     #[inline(always)]
@@ -620,15 +582,7 @@ impl UnaryOpT for Erf {
         0
     }
     #[inline(always)]
-    fn i8(_: i8) -> i8 {
-        0
-    }
-    #[inline(always)]
     fn u32(_: u32) -> u32 {
-        0
-    }
-    #[inline(always)]
-    fn i32(_: i32) -> i32 {
         0
     }
     #[inline(always)]
@@ -662,15 +616,7 @@ impl UnaryOpT for Silu {
         0
     }
     #[inline(always)]
-    fn i8(_: i8) -> i8 {
-        0
-    }
-    #[inline(always)]
     fn u32(_: u32) -> u32 {
-        0
-    }
-    #[inline(always)]
-    fn i32(_: i32) -> i32 {
         0
     }
     #[inline(always)]
@@ -741,15 +687,7 @@ impl UnaryOpT for Abs {
         v
     }
     #[inline(always)]
-    fn i8(v: i8) -> i8 {
-        v
-    }
-    #[inline(always)]
     fn u32(v: u32) -> u32 {
-        v
-    }
-    #[inline(always)]
-    fn i32(v: i32) -> i32 {
         v
     }
     #[inline(always)]
@@ -783,15 +721,7 @@ impl UnaryOpT for Ceil {
         v
     }
     #[inline(always)]
-    fn i8(v: i8) -> i8 {
-        v
-    }
-    #[inline(always)]
     fn u32(v: u32) -> u32 {
-        v
-    }
-    #[inline(always)]
-    fn i32(v: i32) -> i32 {
         v
     }
     #[inline(always)]
@@ -825,15 +755,7 @@ impl UnaryOpT for Floor {
         v
     }
     #[inline(always)]
-    fn i8(v: i8) -> i8 {
-        v
-    }
-    #[inline(always)]
     fn u32(v: u32) -> u32 {
-        v
-    }
-    #[inline(always)]
-    fn i32(v: i32) -> i32 {
         v
     }
     #[inline(always)]
@@ -867,15 +789,7 @@ impl UnaryOpT for Round {
         v
     }
     #[inline(always)]
-    fn i8(v: i8) -> i8 {
-        v
-    }
-    #[inline(always)]
     fn u32(v: u32) -> u32 {
-        v
-    }
-    #[inline(always)]
-    fn i32(v: i32) -> i32 {
         v
     }
     #[inline(always)]
@@ -909,15 +823,7 @@ impl UnaryOpT for GeluErf {
         0
     }
     #[inline(always)]
-    fn i8(_: i8) -> i8 {
-        0
-    }
-    #[inline(always)]
     fn u32(_: u32) -> u32 {
-        0
-    }
-    #[inline(always)]
-    fn i32(_: i32) -> i32 {
         0
     }
     #[inline(always)]
@@ -951,15 +857,7 @@ impl UnaryOpT for Relu {
         v
     }
     #[inline(always)]
-    fn i8(v: i8) -> i8 {
-        v
-    }
-    #[inline(always)]
     fn u32(v: u32) -> u32 {
-        v
-    }
-    #[inline(always)]
-    fn i32(v: i32) -> i32 {
         v
     }
     #[inline(always)]
@@ -1057,16 +955,8 @@ impl UnaryOpT for Sign {
         u8::min(1, v)
     }
     #[inline(always)]
-    fn i8(v: i8) -> i8 {
-        i8::min(1, v)
-    }
-    #[inline(always)]
     fn u32(v: u32) -> u32 {
         u32::min(1, v)
-    }
-    #[inline(always)]
-    fn i32(v: i32) -> i32 {
-        i32::min(1, v)
     }
     #[inline(always)]
     fn i64(v: i64) -> i64 {

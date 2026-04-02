@@ -5,10 +5,10 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use anyhow::{Error as E, Result};
+use clap::{Parser, ValueEnum};
+
 use candle_transformers::models::quantized_stable_lm::Model as QStableLM;
 use candle_transformers::models::stable_lm::{Config, Model as StableLM};
-use clap::{Parser, ValueEnum};
-use std::path::Path;
 
 use candle::{DType, Device, Tensor};
 use candle_examples::token_output_stream::TokenOutputStream;
@@ -54,7 +54,7 @@ impl TextGeneration {
         }
     }
 
-    fn run(&mut self, prompt: &str, sample_len: usize, batch_size: usize) -> Result<()> {
+    fn run(&mut self, prompt: &str, sample_len: usize) -> Result<()> {
         use std::io::Write;
         self.tokenizer.clear();
         let mut tokens = self
@@ -76,31 +76,15 @@ impl TextGeneration {
             Some(token) => token,
             None => anyhow::bail!("cannot find the <|endoftext|> token"),
         };
-        let mut start_gen = std::time::Instant::now();
+        let start_gen = std::time::Instant::now();
         for index in 0..sample_len {
             let context_size = if index > 0 { 1 } else { tokens.len() };
-            if index == 1 {
-                start_gen = std::time::Instant::now()
-            }
             let start_pos = tokens.len().saturating_sub(context_size);
             let ctxt = &tokens[start_pos..];
-            let input = Tensor::new(ctxt, &self.device)?;
-            let input = if batch_size > 1 {
-                let dims = input.layout().dims();
-                input
-                    .broadcast_as((batch_size, if dims.len() > 1 { dims[1] } else { dims[0] }))?
-                    .contiguous()?
-            } else {
-                input.unsqueeze(0)?
-            };
+            let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
             let logits = match &mut self.model {
                 Model::StableLM(m) => m.forward(&input, start_pos)?,
                 Model::Quantized(m) => m.forward(&input, start_pos)?,
-            };
-            let logits = if batch_size > 1 {
-                logits.narrow(0, 0, 1)?
-            } else {
-                logits
             };
             let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
             let logits = if self.repeat_penalty == 1. {
@@ -130,10 +114,9 @@ impl TextGeneration {
             print!("{rest}");
         }
         std::io::stdout().flush()?;
-        let throughput_per_req = (generated_tokens - 1) as f64 / dt.as_secs_f64();
         println!(
-            "\n{} tokens generated ({} x {generated_tokens} tokens), throughput: {:.2} token/s ({} x {:.2} token/s)", generated_tokens * batch_size,
-            batch_size, throughput_per_req * batch_size as f64, batch_size, throughput_per_req
+            "\n{generated_tokens} tokens generated ({:.2} token/s)",
+            generated_tokens as f64 / dt.as_secs_f64(),
         );
         Ok(())
     }
@@ -179,7 +162,7 @@ struct Args {
     seed: u64,
 
     /// The length of the sample to generate (in tokens).
-    #[arg(long, short = 'n', default_value_t = 100)]
+    #[arg(long, short = 'n', default_value_t = 1000)]
     sample_len: usize,
 
     #[arg(long)]
@@ -192,7 +175,10 @@ struct Args {
     which: Which,
 
     #[arg(long)]
-    weight_path: Option<String>,
+    tokenizer_file: Option<String>,
+
+    #[arg(long)]
+    weight_files: Option<String>,
 
     #[arg(long)]
     quantized: bool,
@@ -204,9 +190,6 @@ struct Args {
     /// The context size to consider for the repeat penalty.
     #[arg(long, default_value_t = 64)]
     repeat_last_n: usize,
-
-    #[arg(long, default_value_t = 1)]
-    batch_size: usize,
 }
 
 fn main() -> Result<()> {
@@ -254,38 +237,38 @@ fn main() -> Result<()> {
         RepoType::Model,
         args.revision,
     ));
-    let tokenizer_filename = match &args.weight_path {
-        Some(path) => Path::new(path).join("tokenizer.json"),
+    let tokenizer_filename = match args.tokenizer_file {
+        Some(file) => std::path::PathBuf::from(file),
         None => repo.get("tokenizer.json")?,
     };
-    let filenames = match (args.which, args.quantized) {
-        (Which::V1Orig | Which::V1, true) => vec![repo.get("model-q4k.gguf")?],
-        (Which::V2, true) => {
-            let gguf = api
-                .model("lmz/candle-stablelm".to_string())
-                .get("stablelm-2-1_6b-q4k.gguf")?;
-            vec![gguf]
-        }
-        (Which::V2Zephyr, true) => {
-            let gguf = api
-                .model("lmz/candle-stablelm".to_string())
-                .get("stablelm-2-zephyr-1_6b-q4k.gguf")?;
-            vec![gguf]
-        }
-        (Which::V1Zephyr | Which::Code, true) => {
-            anyhow::bail!("Quantized {:?} variant not supported.", args.which)
-        }
-        (Which::V1Orig | Which::V1 | Which::V1Zephyr | Which::V2 | Which::V2Zephyr, false) => {
-            match &args.weight_path {
-                Some(path) => vec![Path::new(path).join("model.safetensors")],
-                None => vec![repo.get("model.safetensors")?],
+    let filenames = match args.weight_files {
+        Some(files) => files
+            .split(',')
+            .map(std::path::PathBuf::from)
+            .collect::<Vec<_>>(),
+        None => match (args.which, args.quantized) {
+            (Which::V1Orig | Which::V1, true) => vec![repo.get("model-q4k.gguf")?],
+            (Which::V2, true) => {
+                let gguf = api
+                    .model("lmz/candle-stablelm".to_string())
+                    .get("stablelm-2-1_6b-q4k.gguf")?;
+                vec![gguf]
             }
-        }
-        (Which::Code, false) => match &args.weight_path {
-            Some(path) => {
-                candle_examples::hub_load_local_safetensors(path, "model.safetensors.index.json")?
+            (Which::V2Zephyr, true) => {
+                let gguf = api
+                    .model("lmz/candle-stablelm".to_string())
+                    .get("stablelm-2-zephyr-1_6b-q4k.gguf")?;
+                vec![gguf]
             }
-            None => candle_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?,
+            (Which::V1Zephyr | Which::Code, true) => {
+                anyhow::bail!("Quantized {:?} variant not supported.", args.which)
+            }
+            (Which::V1Orig | Which::V1 | Which::V1Zephyr | Which::V2 | Which::V2Zephyr, false) => {
+                vec![repo.get("model.safetensors")?]
+            }
+            (Which::Code, false) => {
+                candle_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?
+            }
         },
     };
 
@@ -296,10 +279,7 @@ fn main() -> Result<()> {
     let config = match args.which {
         Which::V1Orig => Config::stablelm_3b_4e1t(args.use_flash_attn),
         Which::V1 | Which::V1Zephyr | Which::V2 | Which::V2Zephyr | Which::Code => {
-            let config_filename = match &args.weight_path {
-                Some(path) => Path::new(path).join("config.json"),
-                _ => repo.get("config.json")?,
-            };
+            let config_filename = repo.get("config.json")?;
             let config = std::fs::read_to_string(config_filename)?;
             let mut config: Config = serde_json::from_str(&config)?;
             config.set_use_flash_attn(args.use_flash_attn);
@@ -315,7 +295,7 @@ fn main() -> Result<()> {
         let model = QStableLM::new(&config, vb)?;
         Model::Quantized(model)
     } else {
-        let dtype = if device.is_cuda() || device.is_gcu() {
+        let dtype = if device.is_cuda() {
             DType::BF16
         } else {
             DType::F32
@@ -337,6 +317,6 @@ fn main() -> Result<()> {
         args.repeat_last_n,
         &device,
     );
-    pipeline.run(&args.prompt, args.sample_len, args.batch_size)?;
+    pipeline.run(&args.prompt, args.sample_len)?;
     Ok(())
 }

@@ -7,9 +7,7 @@
 use std::sync::Arc;
 
 use candle::{DType, Device, Module, Result, Tensor, D};
-use candle_nn::{
-    apply_rotary_emb_qkv, kvconcat, linear_b as linear, Activation, Linear, RmsNorm, VarBuilder,
-};
+use candle_nn::{linear_b as linear, Activation, Linear, VarBuilder};
 
 fn default_max_position_embeddings() -> usize {
     4096
@@ -45,16 +43,40 @@ impl Config {
     }
 }
 
-fn rms_norm(dim: usize, eps: f64, vb: VarBuilder) -> Result<RmsNorm> {
-    let weight = vb.get(dim, "weight")?;
-    Ok(RmsNorm::new((weight + 1.0f64)?, eps))
+#[derive(Debug, Clone)]
+struct RmsNorm {
+    weight: Tensor,
+    eps: f64,
+}
+
+impl RmsNorm {
+    fn new(dim: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
+        let weight = vb.get(dim, "weight")?;
+        Ok(Self { weight, eps })
+    }
+}
+
+impl Module for RmsNorm {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x_dtype = x.dtype();
+        let internal_dtype = match x_dtype {
+            DType::F16 | DType::BF16 => DType::F32,
+            d => d,
+        };
+        let hidden_size = x.dim(D::Minus1)?;
+        let x = x.to_dtype(internal_dtype)?;
+        let norm_x = (x.sqr()?.sum_keepdim(D::Minus1)? / hidden_size as f64)?;
+        let x_normed = x.broadcast_div(&(norm_x + self.eps)?.sqrt()?)?;
+        x_normed
+            .to_dtype(x_dtype)?
+            .broadcast_mul(&(&self.weight + 1.0)?)
+    }
 }
 
 #[derive(Debug, Clone)]
 struct RotaryEmbedding {
     sin: Tensor,
     cos: Tensor,
-    cos_sin: Tensor,
 }
 
 impl RotaryEmbedding {
@@ -71,12 +93,9 @@ impl RotaryEmbedding {
             .to_dtype(dtype)?
             .reshape((max_seq_len, 1))?;
         let freqs = t.matmul(&inv_freq)?;
-        let cos_sin = Tensor::cat(&[&freqs.cos()?, &freqs.sin()?], D::Minus1)?; //must be contiguous tensor;
-        let freqs = Tensor::cat(&[&freqs, &freqs], D::Minus1)?;
         Ok(Self {
             sin: freqs.sin()?,
             cos: freqs.cos()?,
-            cos_sin,
         })
     }
 
@@ -181,62 +200,39 @@ impl Attention {
         attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
-        let (b_sz, seq_len, _) = xs.dims3()?;
+        let (b_sz, q_len, _) = xs.dims3()?;
 
         let query_states = self.q_proj.forward(xs)?;
         let key_states = self.k_proj.forward(xs)?;
         let value_states = self.v_proj.forward(xs)?;
 
-        let (query_states, key_states, value_states) = if seq_len == 1 {
-            //no need transpose for seq_len == 1, change reshape dim
-            let q = query_states.reshape((b_sz, self.num_heads, seq_len, self.head_dim))?;
-            let k = key_states.reshape((b_sz, self.num_kv_heads, seq_len, self.head_dim))?;
-            let v = value_states.reshape((b_sz, self.num_kv_heads, seq_len, self.head_dim))?;
-            (q, k, v)
-        } else {
-            let q = query_states
-                .reshape((b_sz, seq_len, self.num_heads, self.head_dim))?
-                .transpose(1, 2)?;
-            let k = key_states
-                .reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?
-                .transpose(1, 2)?;
-            let v = value_states
-                .reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?
-                .transpose(1, 2)?;
-            (q, k, v.contiguous()?)
-        };
+        let query_states = query_states
+            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let key_states = key_states
+            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let value_states = value_states
+            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
 
-        #[cfg(feature = "gcu")]
-        let seqlen_offset = Tensor::new(seqlen_offset as i64, &query_states.device())?;
-        let (query_states, key_states) = apply_rotary_emb_qkv(
-            &query_states,
-            &key_states,
-            if query_states.device().is_gcu() {
-                &self.rotary_emb.cos_sin
-            } else {
-                &self.rotary_emb.cos
-            },
-            &self.rotary_emb.sin,
-            &seqlen_offset,
-            0,
-            true,
-            true,
-        )?;
+        let (query_states, key_states) =
+            self.rotary_emb
+                .apply_rotary_emb_qkv(&query_states, &key_states, seqlen_offset)?;
 
         let (key_states, value_states) = match &self.kv_cache {
             None => (key_states, value_states),
             Some((prev_k, prev_v)) => {
-                // let key_states = Tensor::cat(&[prev_k, &key_states], 2)?;
-                // let value_states = Tensor::cat(&[prev_v, &value_states], 2)?;
-                let key_states = kvconcat(prev_k, &key_states, 2)?;
-                let value_states = kvconcat(prev_v, &value_states, 2)?;
+                let key_states = Tensor::cat(&[prev_k, &key_states], 2)?;
+                let value_states = Tensor::cat(&[prev_v, &value_states], 2)?;
                 (key_states, value_states)
             }
         };
         self.kv_cache = Some((key_states.clone(), value_states.clone()));
 
-        let key_states = crate::utils::repeat_kv(key_states, self.num_kv_groups)?; //.contiguous()?;
-        let value_states = crate::utils::repeat_kv(value_states, self.num_kv_groups)?; //.contiguous()?;
+        let key_states = crate::utils::repeat_kv(key_states, self.num_kv_groups)?.contiguous()?;
+        let value_states =
+            crate::utils::repeat_kv(value_states, self.num_kv_groups)?.contiguous()?;
 
         let attn_output = if self.use_flash_attn {
             // flash-attn expects (b_sz, seq_len, nheads, head_dim)
@@ -258,7 +254,7 @@ impl Attention {
         };
         attn_output
             .transpose(1, 2)?
-            .reshape((b_sz, seq_len, ()))?
+            .reshape((b_sz, q_len, ()))?
             .apply(&self.o_proj)
     }
 
@@ -301,8 +297,8 @@ impl DecoderLayer {
         let self_attn = Attention::new(rotary_emb, use_flash_attn, cfg, vb.pp("self_attn"))?;
         let mlp = MLP::new(cfg, vb.pp("mlp"))?;
         let input_layernorm =
-            rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
-        let post_attention_layernorm = rms_norm(
+            RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
+        let post_attention_layernorm = RmsNorm::new(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             vb.pp("post_attention_layernorm"),
@@ -359,7 +355,7 @@ impl Model {
                 DecoderLayer::new(rotary_emb.clone(), use_flash_attn, cfg, vb_l.pp(layer_idx))?;
             layers.push(layer)
         }
-        let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
+        let norm = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
         let lm_head = Linear::new(embed_tokens.embeddings().clone(), None);
         Ok(Self {
             embed_tokens,

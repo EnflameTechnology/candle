@@ -1,15 +1,16 @@
 //! Tensors are N-dimensional matrixes of elements using a single data type.
 #![allow(clippy::redundant_closure_call)]
 use crate::backend::{BackendDevice, BackendStorage};
-#[cfg(feature = "gcu")]
+#[cfg(any(feature = "cuda", feature = "gcu"))]
 use crate::offloadable::OffloadBuffer;
+#[cfg(not(any(feature = "cuda", feature = "gcu")))]
+struct OffloadBuffer {}
 use crate::op::{BackpropOp, BinaryOp, CmpOp, Op, ReduceOp, UnaryOp};
 use crate::scalar::TensorOrScalar;
 use crate::shape::{Dim, Dims};
 use crate::{bail, storage::Storage, DType, Device, Error, Layout, Result, Shape};
 use std::sync::{Arc, RwLock};
-#[cfg(not(feature = "gcu"))]
-struct OffloadBuffer {} //dummy buffer
+
 /// Unique identifier for tensors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TensorId(usize);
@@ -181,14 +182,16 @@ pub(crate) fn from_storage<S: Into<Shape>>(
     Tensor(Arc::new(tensor_))
 }
 
-#[cfg(feature = "gcu")]
+#[cfg(any(feature = "cuda", feature = "gcu"))]
 impl Tensor {
     pub fn offload(&self) -> Result<Tensor> {
         use half::{bf16, f16};
         let cpu_buffer = if self.cpu_offload_buffer.is_none() {
             let storage = match &*self.storage() {
+                Storage::Cpu(storage) => storage.clone(),
+                Storage::Cuda(storage) => storage.to_cpu_storage()?,
+                Storage::Metal(storage) => storage.to_cpu_storage()?,
                 Storage::Gcu(storage) => storage.to_cpu_storage()?,
-                _ => panic!("not supported device for cpu offloading!"),
             };
             let buffer = match self.dtype() {
                 DType::U8 => Arc::new(OffloadBuffer::new(
@@ -197,20 +200,8 @@ impl Tensor {
                     storage.device(),
                     self.device(),
                 )?),
-                DType::I8 => Arc::new(OffloadBuffer::new(
-                    storage.as_slice::<i8>()?,
-                    self.dtype(),
-                    storage.device(),
-                    self.device(),
-                )?),
                 DType::U32 => Arc::new(OffloadBuffer::new(
                     storage.as_slice::<u32>()?,
-                    self.dtype(),
-                    storage.device(),
-                    self.device(),
-                )?),
-                DType::I32 => Arc::new(OffloadBuffer::new(
-                    storage.as_slice::<i32>()?,
                     self.dtype(),
                     storage.device(),
                     self.device(),
@@ -344,23 +335,12 @@ impl Tensor {
         shape: S,
         dtype: DType,
         device: &Device,
+        sync_alloc: bool,
         is_variable: bool,
     ) -> Result<Self> {
         let none = BackpropOp::none();
         let shape = shape.into();
-        let storage = device.zeros(&shape, dtype)?;
-        Ok(from_storage(storage, shape, none, is_variable))
-    }
-
-    pub(crate) fn empty_impl<S: Into<Shape>>(
-        shape: S,
-        dtype: DType,
-        device: &Device,
-        is_variable: bool,
-    ) -> Result<Self> {
-        let none = BackpropOp::none();
-        let shape = shape.into();
-        let storage = unsafe { device.alloc_uninit(&shape, dtype)? };
+        let storage = device.zeros(&shape, dtype, sync_alloc)?;
         Ok(from_storage(storage, shape, none, is_variable))
     }
 
@@ -374,11 +354,29 @@ impl Tensor {
     /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn zeros<S: Into<Shape>>(shape: S, dtype: DType, device: &Device) -> Result<Self> {
-        Self::zeros_impl(shape, dtype, device, false)
+        Self::zeros_impl(shape, dtype, device, false, false)
     }
 
-    pub fn empty<S: Into<Shape>>(shape: S, dtype: DType, device: &Device) -> Result<Self> {
-        Self::empty_impl(shape, dtype, device, false)
+    pub fn empty<S: Into<Shape>>(
+        shape: S,
+        dtype: DType,
+        device: &Device,
+        sync: Option<bool>,
+    ) -> Result<Self> {
+        Self::zeros_impl(shape, dtype, device, sync.unwrap_or(false), false)
+    }
+
+    /// Creates a new tensor backed by uninitialized storage.
+    ///
+    /// # Safety
+    ///
+    /// The returned tensor contains uninitialized memory and must be fully
+    /// written before any read.
+    pub unsafe fn empty_<S: Into<Shape>>(shape: S, dtype: DType, device: &Device) -> Result<Self> {
+        let none = BackpropOp::none();
+        let shape = shape.into();
+        let storage = device.alloc_uninit(&shape, dtype)?;
+        Ok(from_storage(storage, shape, none, false))
     }
 
     /// Creates a new tensor filled with zeros with same shape, dtype, and device as the other
@@ -1574,43 +1572,73 @@ impl Tensor {
 
     /// clear current tensor data to all zeros
     pub fn zero_(&self) -> Result<()> {
-        #[cfg(not(feature = "gcu"))]
-        crate::bail!("Not supported platform!");
-
-        #[cfg(feature = "gcu")]
-        let dev = self.device().as_gcu_device()?;
-        #[cfg(feature = "gcu")]
-        match *self.storage_mut() {
-            Storage::Gcu(ref mut storage) => {
-                use crate::gcu_backend::GcuStorageSlice;
-                match &mut storage.slice {
-                    GcuStorageSlice::U32(dst) => {
-                        let mut dst = dst.slice_mut(..);
-                        dev.memset_zeros(&mut dst).map_err(crate::Error::wrap)
+        #[cfg(feature = "cuda")]
+        if self.device().is_cuda() {
+            let dev = self.device().as_cuda_device()?;
+            return match *self.storage_mut() {
+                Storage::Cuda(ref mut storage) => {
+                    use crate::cuda_backend::CudaStorageSlice;
+                    match &mut storage.slice {
+                        CudaStorageSlice::U32(dst) => {
+                            let mut dst = dst.slice_mut(..);
+                            dev.memset_zeros(&mut dst).map_err(crate::Error::wrap)
+                        }
+                        CudaStorageSlice::I64(dst) => {
+                            let mut dst = dst.slice_mut(..);
+                            dev.memset_zeros(&mut dst).map_err(crate::Error::wrap)
+                        }
+                        CudaStorageSlice::F32(dst) => {
+                            let mut dst = dst.slice_mut(..);
+                            dev.memset_zeros(&mut dst).map_err(crate::Error::wrap)
+                        }
+                        CudaStorageSlice::F16(dst) => {
+                            let mut dst = dst.slice_mut(..);
+                            dev.memset_zeros(&mut dst).map_err(crate::Error::wrap)
+                        }
+                        CudaStorageSlice::BF16(dst) => {
+                            let mut dst = dst.slice_mut(..);
+                            dev.memset_zeros(&mut dst).map_err(crate::Error::wrap)
+                        }
+                        _ => crate::bail!("Not supported dtype!"),
                     }
-                    GcuStorageSlice::I64(dst) => {
-                        let mut dst = dst.slice_mut(..);
-                        dev.memset_zeros(&mut dst).map_err(crate::Error::wrap)
-                    }
-                    GcuStorageSlice::F32(dst) => {
-                        let mut dst = dst.slice_mut(..);
-                        dev.memset_zeros(&mut dst).map_err(crate::Error::wrap)
-                    }
-                    GcuStorageSlice::F16(dst) => {
-                        let mut dst = dst.slice_mut(..);
-                        dev.memset_zeros(&mut dst).map_err(crate::Error::wrap)
-                    }
-                    GcuStorageSlice::BF16(dst) => {
-                        let mut dst = dst.slice_mut(..);
-                        dev.memset_zeros(&mut dst).map_err(crate::Error::wrap)
-                    }
-                    _ => crate::bail!("Not supported dtype!"),
                 }
-            }
-            _ => {
-                crate::bail!("Not supported platform!")
-            }
+                _ => crate::bail!("Not supported platform!"),
+            };
         }
+        #[cfg(feature = "gcu")]
+        if self.device().is_gcu() {
+            let dev = self.device().as_gcu_device()?;
+            return match *self.storage_mut() {
+                Storage::Gcu(ref mut storage) => {
+                    use crate::gcu_backend::GcuStorageSlice;
+                    match &mut storage.slice {
+                        GcuStorageSlice::U32(dst) => {
+                            let mut dst = dst.slice_mut(..);
+                            dev.memset_zeros(&mut dst).map_err(crate::Error::wrap)
+                        }
+                        GcuStorageSlice::I64(dst) => {
+                            let mut dst = dst.slice_mut(..);
+                            dev.memset_zeros(&mut dst).map_err(crate::Error::wrap)
+                        }
+                        GcuStorageSlice::F32(dst) => {
+                            let mut dst = dst.slice_mut(..);
+                            dev.memset_zeros(&mut dst).map_err(crate::Error::wrap)
+                        }
+                        GcuStorageSlice::F16(dst) => {
+                            let mut dst = dst.slice_mut(..);
+                            dev.memset_zeros(&mut dst).map_err(crate::Error::wrap)
+                        }
+                        GcuStorageSlice::BF16(dst) => {
+                            let mut dst = dst.slice_mut(..);
+                            dev.memset_zeros(&mut dst).map_err(crate::Error::wrap)
+                        }
+                        _ => crate::bail!("Not supported dtype!"),
+                    }
+                }
+                _ => crate::bail!("Not supported platform!"),
+            };
+        }
+        crate::bail!("Not supported platform!")
     }
 
     /// Embeds the values of the `src` tensor into the `self` tensor on the first dimension.
@@ -1720,6 +1748,17 @@ impl Tensor {
         Ok(from_storage(storage, self.shape(), op, false))
     }
 
+    /// Gather values across the target dimension.
+    ///
+    /// # Arguments
+    ///
+    /// * `self` - The input tensor.
+    /// * `indexes` - The indices of elements to gather, this should have same number of dimensions as `self`
+    ///   and indexes.dims()[d] <= self.dims()[d] for all dimensions d != dim
+    /// * `dim` - the target dimension.
+    ///
+    /// The resulting tensor has the same shape as `indexes` and use values from `self` indexed on
+    /// dimension `dim` by the values in `indexes`.
     pub fn gather<D: Dim>(&self, indexes: &Self, dim: D) -> Result<Self> {
         let dim = dim.to_index(self.shape(), "gather")?;
 
@@ -1818,7 +1857,6 @@ impl Tensor {
             Storage::Cpu(storage) => from_cpu_storage(storage),
             Storage::Cuda(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::Gcu(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
-
             Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
         }
     }
@@ -1851,7 +1889,6 @@ impl Tensor {
             Storage::Cpu(storage) => from_cpu_storage(storage),
             Storage::Cuda(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::Gcu(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
-
             Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
         }
     }
@@ -1894,7 +1931,6 @@ impl Tensor {
             Storage::Cpu(storage) => from_cpu_storage(storage),
             Storage::Cuda(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::Gcu(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
-
             Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
         }
     }
@@ -2272,12 +2308,13 @@ impl Tensor {
                     let cpu_storage = storage.to_cpu_storage()?;
                     Storage::Gcu(gcu.storage_from_cpu_storage(&cpu_storage)?)
                 }
-                (Storage::Gcu(storage), Device::Cpu) => {
-                    let cpu_storage = storage.to_cpu_storage()?;
-                    Storage::Cpu(cpu_storage)
-                }
+                (Storage::Gcu(storage), Device::Cpu) => Storage::Cpu(storage.to_cpu_storage()?),
                 _ => {
-                    bail!("not implemented yet")
+                    bail!(
+                        "not implemented yet, self.device: {:?}, device: {:?}",
+                        self.device(),
+                        device
+                    )
                 }
             };
             let op = BackpropOp::new1(self, Op::ToDevice);
@@ -2425,7 +2462,7 @@ impl Tensor {
             let tensor_ = Tensor_ {
                 id: TensorId::new(),
                 storage: self.storage.clone(),
-                layout: Layout::contiguous_with_offset(shape, &self.layout),
+                layout: Layout::contiguous_with_offset(shape, self.layout.start_offset()),
                 op,
                 is_variable: false,
                 dtype: self.dtype,
@@ -2461,8 +2498,20 @@ impl Tensor {
         let dim = dim.to_index(self.shape(), "squeeze")?;
         if dims[dim] == 1 {
             let mut dims = dims.to_vec();
+            let mut strides = self.stride().to_vec();
             dims.remove(dim);
-            self.reshape(dims)
+            strides.remove(dim);
+            let tensor_ = Tensor_ {
+                id: TensorId::new(),
+                storage: self.storage.clone(),
+                layout: Layout::new(dims.into(), strides, self.layout.start_offset()),
+                op: BackpropOp::new1(self, Op::Reshape),
+                is_variable: false,
+                dtype: self.dtype,
+                device: self.device.clone(),
+                cpu_offload_buffer: None,
+            };
+            Ok(Tensor(Arc::new(tensor_)))
         } else {
             Ok(self.clone())
         }
@@ -2483,10 +2532,25 @@ impl Tensor {
     /// ```
     pub fn unsqueeze<D: Dim>(&self, dim: D) -> Result<Self> {
         let mut dims = self.dims().to_vec();
+        let mut strides = self.stride().to_vec();
         let dim = dim.to_index_plus_one(self.shape(), "unsqueeze")?;
         // Cannot panic because to_index_plus_one already checks dimensions
         dims.insert(dim, 1);
-        self.reshape(dims)
+        // Any stride would work here, but we pick one so as to maximize the probability to remain
+        // C contiguous.
+        let stride = if dim < strides.len() { strides[dim] } else { 1 };
+        strides.insert(dim, stride);
+        let tensor_ = Tensor_ {
+            id: TensorId::new(),
+            storage: self.storage.clone(),
+            layout: Layout::new(dims.into(), strides, self.layout.start_offset()),
+            op: BackpropOp::new1(self, Op::Reshape),
+            is_variable: false,
+            dtype: self.dtype,
+            device: self.device.clone(),
+            cpu_offload_buffer: None,
+        };
+        Ok(Tensor(Arc::new(tensor_)))
     }
 
     /// Stacks two or more tensors along a particular dimension.
@@ -2517,152 +2581,8 @@ impl Tensor {
         Self::cat(&args, dim)
     }
 
-    /// Concatenates two or more tensors along a particular dimension.
-    ///
-    /// All tensors must of the same rank, and the output will have
-    /// the same rank
-    ///
-    /// ```rust
-    /// # use candle_core::{Tensor, DType, Device};
-    /// let a = Tensor::zeros((2, 3), DType::F32, &Device::Cpu)?;
-    /// let b = Tensor::zeros((2, 3), DType::F32, &Device::Cpu)?;
-    ///
-    /// let c = Tensor::cat(&[&a, &b], 0)?;
-    /// assert_eq!(c.shape().dims(), &[4, 3]);
-    ///
-    /// let c = Tensor::cat(&[&a, &b], 1)?;
-    /// assert_eq!(c.shape().dims(), &[2, 6]);
-    /// # Ok::<(), candle_core::Error>(())
-    /// ```
-    // pub fn cat<A: AsRef<Tensor>, D: Dim>(args: &[A], dim: D) -> Result<Self> {
-    //     if args.is_empty() {
-    //         Err(Error::OpRequiresAtLeastOneTensor { op: "cat" }.bt())?
-    //     }
-    //     let arg0 = args[0].as_ref();
-    //     if args.len() == 1 {
-    //         return Ok(arg0.clone());
-    //     }
-    //     let dim = dim.to_index(arg0.shape(), "cat")?;
-    //     for arg in args {
-    //         arg.as_ref().check_dim(dim, "cat")?;
-    //     }
-    //     for (arg_idx, arg) in args.iter().enumerate() {
-    //         let arg = arg.as_ref();
-    //         if arg0.rank() != arg.rank() {
-    //             Err(Error::UnexpectedNumberOfDims {
-    //                 expected: arg0.rank(),
-    //                 got: arg.rank(),
-    //                 shape: arg.shape().clone(),
-    //             }
-    //             .bt())?
-    //         }
-    //         for (dim_idx, (v1, v2)) in arg0
-    //             .shape()
-    //             .dims()
-    //             .iter()
-    //             .zip(arg.shape().dims().iter())
-    //             .enumerate()
-    //         {
-    //             if dim_idx != dim && v1 != v2 {
-    //                 Err(Error::ShapeMismatchCat {
-    //                     dim: dim_idx,
-    //                     first_shape: arg0.shape().clone(),
-    //                     n: arg_idx + 1,
-    //                     nth_shape: arg.shape().clone(),
-    //                 }
-    //                 .bt())?
-    //             }
-    //         }
-    //     }
-    //     if dim == 0 {
-    //         Self::cat0(args)
-    //     } else {
-    //         // TODO: Avoid these transpositions and have an implementation that works
-    //         // for dim != 0...
-    //         let args: Vec<Tensor> = args
-    //             .iter()
-    //             .map(|a| a.as_ref().transpose(0, dim))
-    //             .collect::<Result<Vec<_>>>()?;
-    //         let cat = Self::cat0(&args)?;
-    //         cat.transpose(0, dim)
-    //     }
-    // }
-
-    // fn cat0<A: AsRef<Tensor>>(args: &[A]) -> Result<Self> {
-    //     if args.is_empty() {
-    //         Err(Error::OpRequiresAtLeastOneTensor { op: "cat" }.bt())?
-    //     }
-    //     let arg0 = args[0].as_ref();
-    //     if args.len() == 1 {
-    //         return Ok(arg0.clone());
-    //     }
-    //     let rank = arg0.rank();
-    //     let device = arg0.device();
-    //     let dtype = arg0.dtype();
-    //     let first_dims = arg0.shape().dims();
-    //     let mut cat_dims = first_dims.to_vec();
-    //     cat_dims[0] = 0;
-    //     let mut offsets = vec![0usize];
-    //     for (arg_idx, arg) in args.iter().enumerate() {
-    //         let arg = arg.as_ref();
-    //         if arg.dtype() != dtype {
-    //             Err(Error::DTypeMismatchBinaryOp {
-    //                 lhs: dtype,
-    //                 rhs: arg.dtype(),
-    //                 op: "cat",
-    //             }
-    //             .bt())?
-    //         }
-    //         if arg.device().location() != device.location() {
-    //             Err(Error::DeviceMismatchBinaryOp {
-    //                 lhs: device.location(),
-    //                 rhs: arg.device().location(),
-    //                 op: "cat",
-    //             }
-    //             .bt())?
-    //         }
-    //         if rank != arg.rank() {
-    //             Err(Error::UnexpectedNumberOfDims {
-    //                 expected: rank,
-    //                 got: arg.rank(),
-    //                 shape: arg.shape().clone(),
-    //             }
-    //             .bt())?
-    //         }
-    //         for (dim_idx, (v1, v2)) in arg0
-    //             .shape()
-    //             .dims()
-    //             .iter()
-    //             .zip(arg.shape().dims().iter())
-    //             .enumerate()
-    //         {
-    //             if dim_idx == 0 {
-    //                 cat_dims[0] += v2;
-    //             }
-    //             if dim_idx != 0 && v1 != v2 {
-    //                 Err(Error::ShapeMismatchCat {
-    //                     dim: dim_idx,
-    //                     first_shape: arg0.shape().clone(),
-    //                     n: arg_idx + 1,
-    //                     nth_shape: arg.shape().clone(),
-    //                 }
-    //                 .bt())?
-    //             }
-    //         }
-    //         let next_offset = offsets.last().unwrap() + arg.elem_count();
-    //         offsets.push(next_offset);
-    //     }
-    //     let shape = Shape::from(cat_dims);
-    //     let op = BackpropOp::new(args, |args| Op::Cat(args, 0));
-    //     let mut storage = device.zeros(&shape, dtype)?;
-    //     for (arg, &offset) in args.iter().zip(offsets.iter()) {
-    //         let arg = arg.as_ref();
-    //         arg.storage()
-    //             .copy_strided_src(&mut storage, offset, arg.layout())?;
-    //     }
-    //     Ok(from_storage(storage, shape, op, false))
-    // }
-
+    /// Pad the input tensor using 0s along dimension `dim`. This adds `left` elements before the
+    /// input tensor values and `right` elements after.
     pub fn pad_with_zeros<D: Dim>(&self, dim: D, left: usize, right: usize) -> Result<Self> {
         if left == 0 && right == 0 {
             Ok(self.clone())
@@ -2912,6 +2832,47 @@ impl Tensor {
     /// Broadcasting version of `pow`.
     pub fn broadcast_pow(&self, rhs: &Tensor) -> Result<Self> {
         rhs.broadcast_mul(&self.log()?)?.exp()
+    }
+
+    pub fn unfold<D: Dim>(&self, dim: D, size: usize, step: usize) -> Result<Self> {
+        let mut sizes = self.dims().to_vec();
+        let mut strides = self.stride().to_vec();
+
+        let dim = dim.to_index(self.shape(), "unfold")?;
+
+        let max_len = if self.dims().is_empty() {
+            1
+        } else {
+            sizes[dim]
+        };
+        if size > max_len {
+            bail!(
+                "unsqueeze: maximum size for tensor at dimension {dim} is {max_len} but size is {size}"
+            )
+        }
+        sizes.push(size);
+        strides.push(if self.dims().is_empty() {
+            1
+        } else {
+            strides[dim]
+        });
+
+        if !self.dims().is_empty() {
+            sizes[dim] = ((sizes[dim] as f32 - size as f32) / step as f32 + 1.) as usize;
+            strides[dim] *= step;
+        }
+
+        let tensor_ = Tensor_ {
+            id: TensorId::new(),
+            storage: self.storage.clone(),
+            layout: Layout::new(sizes.into(), strides, self.layout.start_offset()),
+            op: BackpropOp::new1(self, Op::Reshape),
+            is_variable: false,
+            dtype: self.dtype,
+            device: self.device.clone(),
+            cpu_offload_buffer: None,
+        };
+        Ok(Tensor(Arc::new(tensor_)))
     }
 }
 

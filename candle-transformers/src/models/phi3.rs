@@ -20,7 +20,7 @@
 // This implementation is based on:
 // https://huggingface.co/microsoft/Phi-3-mini-4k-instruct/blob/main/modeling_phi3.py
 use crate::models::with_tracing::{linear_no_bias as linear, Linear, RmsNorm};
-use candle::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use candle::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::VarBuilder;
 use std::sync::Arc;
 
@@ -52,7 +52,6 @@ impl Config {
 pub struct RotaryEmbedding {
     sin: Tensor,
     cos: Tensor,
-    cos_sin: Tensor,
 }
 
 impl RotaryEmbedding {
@@ -69,11 +68,9 @@ impl RotaryEmbedding {
             .to_dtype(dtype)?
             .reshape((max_seq_len, 1))?;
         let freqs = t.matmul(&inv_freq)?;
-        let cos_sin = Tensor::cat(&[&freqs.cos()?, &freqs.sin()?], D::Minus1)?; //must be contiguous tensor;
         Ok(Self {
             sin: freqs.sin()?,
             cos: freqs.cos()?,
-            cos_sin,
         })
     }
 
@@ -83,20 +80,12 @@ impl RotaryEmbedding {
         k: &Tensor,
         seqlen_offset: usize,
     ) -> Result<(Tensor, Tensor)> {
-        let (b_sz, _h, seq_len, _n_embd) = q.dims4()?;
-        #[cfg(feature = "gcu")]
-        let seqlen_offset = Tensor::new(seqlen_offset as i64, &q.device())?;
-
-        candle_nn::apply_rotary_emb_qkv(
-            q,
-            k,
-            &self.cos_sin,
-            &self.sin,
-            &seqlen_offset,
-            0,
-            true,
-            true,
-        )
+        let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
+        let cos = self.cos.narrow(0, seqlen_offset, seq_len)?;
+        let sin = self.sin.narrow(0, seqlen_offset, seq_len)?;
+        let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
+        let k_embed = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
+        Ok((q_embed, k_embed))
     }
 }
 
@@ -138,7 +127,7 @@ impl Attention {
         attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
-        let (b_sz, seq_len, _) = xs.dims3()?;
+        let (b_sz, q_len, _) = xs.dims3()?;
 
         let qkv = self.qkv_proj.forward(xs)?;
         let query_pos = self.num_heads * self.head_dim;
@@ -150,24 +139,15 @@ impl Attention {
             self.num_kv_heads * self.head_dim,
         )?;
 
-        let (query_states, key_states, value_states) = if seq_len == 1 {
-            //no need transpose for seq_len == 1, change reshape dim
-            let q = query_states.reshape((b_sz, self.num_heads, seq_len, self.head_dim))?;
-            let k = key_states.reshape((b_sz, self.num_kv_heads, seq_len, self.head_dim))?;
-            let v = value_states.reshape((b_sz, self.num_kv_heads, seq_len, self.head_dim))?;
-            (q, k, v)
-        } else {
-            let q = query_states
-                .reshape((b_sz, seq_len, self.num_heads, self.head_dim))?
-                .transpose(1, 2)?;
-            let k = key_states
-                .reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?
-                .transpose(1, 2)?;
-            let v = value_states
-                .reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?
-                .transpose(1, 2)?;
-            (q, k, v.contiguous()?)
-        };
+        let query_states = query_states
+            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let key_states = key_states
+            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let value_states = value_states
+            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
 
         let (query_states, key_states) =
             self.rotary_emb
@@ -176,15 +156,16 @@ impl Attention {
         let (key_states, value_states) = match &self.kv_cache {
             None => (key_states, value_states),
             Some((prev_k, prev_v)) => {
-                let key_states = candle_nn::kvconcat(prev_k, &key_states, 2)?;
-                let value_states = candle_nn::kvconcat(prev_v, &value_states, 2)?;
+                let key_states = Tensor::cat(&[prev_k, &key_states], 2)?;
+                let value_states = Tensor::cat(&[prev_v, &value_states], 2)?;
                 (key_states, value_states)
             }
         };
         self.kv_cache = Some((key_states.clone(), value_states.clone()));
 
-        let key_states = crate::utils::repeat_kv(key_states, self.num_kv_groups)?; //.contiguous()?;
-        let value_states = crate::utils::repeat_kv(value_states, self.num_kv_groups)?; //.contiguous()?;
+        let key_states = crate::utils::repeat_kv(key_states, self.num_kv_groups)?.contiguous()?;
+        let value_states =
+            crate::utils::repeat_kv(value_states, self.num_kv_groups)?.contiguous()?;
 
         let attn_output = {
             let scale = 1f64 / f64::sqrt(self.head_dim as f64);
@@ -199,7 +180,7 @@ impl Attention {
         };
         attn_output
             .transpose(1, 2)?
-            .reshape((b_sz, seq_len, ()))?
+            .reshape((b_sz, q_len, ()))?
             .apply(&self.o_proj)
     }
 
@@ -354,7 +335,7 @@ impl Model {
         for layer in self.layers.iter_mut() {
             xs = layer.forward(&xs, attention_mask.as_ref(), seqlen_offset)?
         }
-        xs.i((.., seq_len - 1, ..))?
+        xs.narrow(1, seq_len - 1, 1)?
             .apply(&self.norm)?
             .apply(&self.lm_head)
     }

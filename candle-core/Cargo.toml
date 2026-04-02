@@ -14,7 +14,7 @@ accelerate-src = { workspace = true, optional = true }
 byteorder = { workspace = true }
 candle-kernels = { workspace = true, optional = true }
 candle-metal-kernels = { workspace = true, optional = true }
-metal = { workspace = true, optional = true}
+metal = { workspace = true, optional = true }
 cudarc = { workspace = true, optional = true }
 gemm = { workspace = true }
 half = { workspace = true }
@@ -28,37 +28,36 @@ rand_distr = { workspace = true }
 rayon = { workspace = true }
 safetensors = { workspace = true }
 thiserror = { workspace = true }
-ug = { workspace = true }
-ug-cuda = { workspace = true, optional = true }
 ug-metal = { workspace = true, optional = true }
 yoke = { workspace = true }
 zip = { workspace = true }
 
-ubridge = { git = "https://github.com/EnflameTechnology/Ubridge.git", version = "0.1.0", optional=true, rev = "36b9d09"}
-uhal = { git = "https://github.com/EnflameTechnology/UHHI.git", version = "0.1.0", optional=true, rev = "0980208"}
-cust_core = { git = "https://github.com/EnflameTechnology/UHHI.git", version = "0.1.0", optional=true, rev = "0980208"}
+ubridge = { git = "https://github.com/EnflameTechnology/Ubridge.git", version = "0.1.0", optional = true, rev = "36b9d09" }
+uhal = { git = "https://github.com/EnflameTechnology/UHHI.git", version = "0.1.0", optional = true, rev = "0980208" }
+cust_core = { git = "https://github.com/EnflameTechnology/UHHI.git", version = "0.1.0", optional = true, rev = "0980208" }
 
-float_eq = { version = "0.7.0"}
+float_eq = { version = "0.7.0" }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ug = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
 criterion = { workspace = true }
 
-
 [features]
-gcu = ["ubridge", "uhal", "cust_core"]
+gcu = ["ubridge", "uhal", "cust_core", "ubridge/graph"]
 scorpio = ["ubridge", "uhal", "cust_core", "ubridge/scorpio"]
-cuda = ["cudarc", "dep:candle-kernels", "dep:ug-cuda"]
+cuda = ["cudarc", "dep:candle-kernels"]
 cudnn = ["cuda", "cudarc/cudnn"]
+graph = ["cuda", "cudarc/graph"]
 mkl = ["dep:libc", "dep:intel-mkl-src"]
 accelerate = ["dep:libc", "dep:accelerate-src"]
 metal = ["dep:metal", "dep:candle-metal-kernels", "dep:ug-metal"]
 async = []
 eccl = ["ubridge/eccl", "uhal", "cust_core", "ubridge/scorpio"]
-nccl = ["cudarc/nccl", "dep:candle-kernels", "dep:ug-cuda"]
-graph = ["ubridge/graph"]
-
+nccl = ["cudarc/nccl", "dep:candle-kernels"]
 
 [[bench]]
 name = "bench_main"

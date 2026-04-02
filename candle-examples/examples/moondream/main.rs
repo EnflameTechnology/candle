@@ -80,12 +80,10 @@ impl TextGeneration {
         };
         let (bos_token, eos_token) = (special_token, special_token);
 
-        let mut start_gen = std::time::Instant::now();
+        let start_gen = std::time::Instant::now();
+        let mut load_t = std::time::Duration::from_secs_f64(0f64);
         for index in 0..sample_len {
             let context_size = if index > 0 { 1 } else { tokens.len() };
-            if index == 1 {
-                start_gen = std::time::Instant::now()
-            }
             let ctxt = &tokens[tokens.len().saturating_sub(context_size)..];
             let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
             let logits = if index > 0 {
@@ -95,7 +93,7 @@ impl TextGeneration {
                 }
             } else {
                 let bos_token = Tensor::new(&[bos_token], &self.device)?.unsqueeze(0)?;
-                match self.model {
+                let logits = match self.model {
                     Model::Moondream(ref mut model) => {
                         model
                             .text_model
@@ -106,7 +104,10 @@ impl TextGeneration {
                             .text_model
                             .forward_with_img(&bos_token, &input, image_embeds)?
                     }
-                }
+                };
+                load_t = start_gen.elapsed();
+                println!("load_t: {:?}", load_t);
+                logits
             };
             let logits = logits.squeeze(0)?.to_dtype(DType::F32)?;
             let logits = if self.repeat_penalty == 1. {
@@ -130,7 +131,7 @@ impl TextGeneration {
             std::io::stdout().flush()?;
         }
 
-        let dt = start_gen.elapsed();
+        let dt = start_gen.elapsed() - load_t;
         println!(
             "\ngenerated in {} seconds\n{generated_tokens} tokens generated ({:.2} token/s)",
             dt.as_secs_f64(),
@@ -258,8 +259,8 @@ async fn main() -> anyhow::Result<()> {
                 ("santiagomed/candle-moondream".to_string(), None)
             } else {
                 (
-                    "vikhyatk/moondream2".to_string(),
-                    Some("30c7cdf3fa6914f50bee3956694374143f5cc884"),
+                    "vikhyatk/moondream1".to_string(),
+                    Some("f6e9da68e8f1b78b8f3ee10905d56826db7a5802"),
                 )
             }
         }
@@ -301,8 +302,6 @@ async fn main() -> anyhow::Result<()> {
         DType::F32
     } else if device.is_cuda() || args.f16 {
         DType::F16
-    } else if device.is_gcu() {
-        DType::BF16
     } else {
         DType::F32
     };

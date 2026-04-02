@@ -130,7 +130,6 @@ fn from_raw_data<T: super::GgmlType + Send + Sync + 'static>(
         Device::Cpu => QStorage::Cpu(Box::new(data.to_vec())),
         Device::Metal(metal) => super::metal::load_quantized(metal, data)?,
         Device::Cuda(cuda) => super::cuda::load_quantized(cuda, data)?,
-        Device::Gcu(_) => todo!(),
     };
     super::QTensor::new(data, dims)
 }
@@ -154,6 +153,7 @@ pub fn qtensor_from_ggml(
     match ggml_dtype {
         GgmlDType::F32 => from_raw_data::<f32>(raw_data, size_in_bytes, dims, device),
         GgmlDType::F16 => from_raw_data::<half::f16>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::BF16 => from_raw_data::<half::bf16>(raw_data, size_in_bytes, dims, device),
         GgmlDType::Q4_0 => {
             from_raw_data::<k_quants::BlockQ4_0>(raw_data, size_in_bytes, dims, device)
         }

@@ -1,13 +1,10 @@
-use candle_transformers::models::glm4::*;
-use clap::Parser;
-
 use candle::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
+use candle_transformers::models::glm4::*;
+use clap::Parser;
 use hf_hub::{Repo, RepoType};
-use std::path::Path;
 use tokenizers::Tokenizer;
-
 struct TextGeneration {
     model: Model,
     device: Device,
@@ -20,11 +17,8 @@ struct TextGeneration {
 impl TextGeneration {
     #[allow(clippy::too_many_arguments)]
     fn new(model: Model, tokenizer: Tokenizer, args: Args, device: &Device, dtype: DType) -> Self {
-        let logits_processor = LogitsProcessor::new(
-            args.seed,
-            Some(args.temperature.unwrap_or(0.8)),
-            Some(args.top_p.unwrap_or(0.8)),
-        );
+        let logits_processor =
+            LogitsProcessor::new(args.seed, Some(args.temperature), Some(args.top_p));
         Self {
             model,
             tokenizer,
@@ -130,12 +124,12 @@ struct Args {
     verbose: bool,
 
     /// The temperature used to generate samples.
-    #[arg(long)]
-    temperature: Option<f64>,
+    #[arg(long, default_value_t = 0.8)]
+    temperature: f64,
 
     /// Nucleus sampling probability cutoff.
-    #[arg(long)]
-    top_p: Option<f64>,
+    #[arg(long, default_value_t = 0.8)]
+    top_p: f64,
 
     /// The seed to use when generating random samples.
     #[arg(long, default_value_t = 299792458)]
@@ -158,15 +152,12 @@ struct Args {
     tokenizer: Option<String>,
 
     /// Penalty to be applied for repeating tokens, 1. means no penalty.
-    #[arg(long, default_value_t = 1.)]
+    #[arg(long, default_value_t = 1.2)]
     repeat_penalty: f32,
 
     /// The context size to consider for the repeat penalty.
     #[arg(long, default_value_t = 64)]
     repeat_last_n: usize,
-
-    #[arg(long)]
-    dtype: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -180,9 +171,7 @@ fn main() -> anyhow::Result<()> {
     );
     println!(
         "temp: {:.2} repeat-penalty: {:.2} repeat-last-n: {}",
-        args.temperature.unwrap_or(0.8),
-        args.repeat_penalty,
-        args.repeat_last_n
+        args.temperature, args.repeat_penalty, args.repeat_last_n
     );
 
     let start = std::time::Instant::now();
@@ -204,25 +193,15 @@ fn main() -> anyhow::Result<()> {
         None => "main".to_string(),
     };
     let repo = api.repo(Repo::with_revision(model_id, RepoType::Model, revision));
-
-    let tokenizer_filename = match &args.weight_path {
-        Some(path) => {
-            if Path::new(path).join("tokenizer.json").exists() {
-                Path::new(path).join("tokenizer.json")
-            } else {
-                api.model("THUDM/codegeex4-all-9b".to_string())
-                    .get("tokenizer.json")
-                    .map_err(anyhow::Error::msg)?
-            }
-        }
+    let tokenizer_filename = match args.tokenizer.as_ref() {
+        Some(file) => std::path::PathBuf::from(file),
         None => api
             .model("THUDM/codegeex4-all-9b".to_string())
             .get("tokenizer.json")
             .map_err(anyhow::Error::msg)?,
     };
-
     let config_filename = match &args.weight_path {
-        Some(path) => Path::new(path).join("config.json"),
+        Some(path) => std::path::Path::new(path).join("config.json"),
         _ => repo.get("config.json")?,
     };
 
@@ -239,12 +218,10 @@ fn main() -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     let config: Config = serde_json::from_slice(&std::fs::read(config_filename)?)?;
     let device = candle_examples::device(args.cpu)?;
-    let dtype = match args.dtype.as_deref() {
-        Some("f16") => DType::F16,
-        Some("bf16") => DType::BF16,
-        Some("f32") => DType::F32,
-        Some(dtype) => panic!("Unsupported dtype {dtype}"),
-        None => DType::BF16,
+    let dtype = if device.is_cuda() {
+        DType::BF16
+    } else {
+        DType::F32
     };
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
     let model = Model::new(&config, vb)?;

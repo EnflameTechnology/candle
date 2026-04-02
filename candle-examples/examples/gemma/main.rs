@@ -5,10 +5,11 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use anyhow::{Error as E, Result};
+use clap::Parser;
+
 use candle_transformers::models::gemma::{Config as Config1, Model as Model1};
 use candle_transformers::models::gemma2::{Config as Config2, Model as Model2};
-use clap::Parser;
-use std::path::Path;
+use candle_transformers::models::gemma3::{Config as Config3, Model as Model3};
 
 use candle::{DType, Device, Tensor};
 use candle_examples::token_output_stream::TokenOutputStream;
@@ -47,29 +48,14 @@ enum Which {
     BaseV2_9B,
     #[value(name = "2-9b-it")]
     InstructV2_9B,
-}
-
-impl Which {
-    fn is_v1(&self) -> bool {
-        match self {
-            Self::Base2B
-            | Self::Base7B
-            | Self::Instruct2B
-            | Self::Instruct7B
-            | Self::InstructV1_1_2B
-            | Self::InstructV1_1_7B
-            | Self::CodeBase2B
-            | Self::CodeBase7B
-            | Self::CodeInstruct2B
-            | Self::CodeInstruct7B => true,
-            Self::BaseV2_2B | Self::InstructV2_2B | Self::BaseV2_9B | Self::InstructV2_9B => false,
-        }
-    }
+    #[value(name = "3-1b")]
+    BaseV3_1B,
 }
 
 enum Model {
     V1(Model1),
     V2(Model2),
+    V3(Model3),
 }
 
 impl Model {
@@ -77,6 +63,7 @@ impl Model {
         match self {
             Self::V1(m) => m.forward(input_ids, pos),
             Self::V2(m) => m.forward(input_ids, pos),
+            Self::V3(m) => m.forward(input_ids, pos),
         }
     }
 }
@@ -113,7 +100,7 @@ impl TextGeneration {
         }
     }
 
-    fn run(&mut self, prompt: &str, sample_len: usize, batch_size: usize) -> Result<()> {
+    fn run(&mut self, prompt: &str, sample_len: usize) -> Result<()> {
         use std::io::Write;
         self.tokenizer.clear();
         let mut tokens = self
@@ -135,29 +122,13 @@ impl TextGeneration {
             Some(token) => token,
             None => anyhow::bail!("cannot find the <eos> token"),
         };
-        let mut start_gen = std::time::Instant::now();
+        let start_gen = std::time::Instant::now();
         for index in 0..sample_len {
             let context_size = if index > 0 { 1 } else { tokens.len() };
             let start_pos = tokens.len().saturating_sub(context_size);
             let ctxt = &tokens[start_pos..];
-            let input = Tensor::new(ctxt, &self.device)?;
-            let input = if batch_size > 1 {
-                let dims = input.layout().dims();
-                input
-                    .broadcast_as((batch_size, if dims.len() > 1 { dims[1] } else { dims[0] }))?
-                    .contiguous()?
-            } else {
-                input.unsqueeze(0)?
-            };
-            if index == 1 {
-                start_gen = std::time::Instant::now()
-            }
+            let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
             let logits = self.model.forward(&input, start_pos)?;
-            let logits = if batch_size > 1 {
-                logits.narrow(0, 0, 1)?
-            } else {
-                logits
-            };
             let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
             let logits = if self.repeat_penalty == 1. {
                 logits
@@ -186,10 +157,9 @@ impl TextGeneration {
             print!("{rest}");
         }
         std::io::stdout().flush()?;
-        let throughput_per_req = (generated_tokens - 1) as f64 / dt.as_secs_f64();
         println!(
-            "\n{} tokens generated ({} x {generated_tokens} tokens), throughput: {:.2} token/s ({} x {:.2} token/s)", generated_tokens * batch_size,
-            batch_size, throughput_per_req * batch_size as f64, batch_size, throughput_per_req
+            "\n{generated_tokens} tokens generated ({:.2} token/s)",
+            generated_tokens as f64 / dt.as_secs_f64(),
         );
         Ok(())
     }
@@ -232,7 +202,13 @@ struct Args {
     revision: String,
 
     #[arg(long)]
-    weight_path: Option<String>,
+    tokenizer_file: Option<String>,
+
+    #[arg(long)]
+    config_file: Option<String>,
+
+    #[arg(long)]
+    weight_files: Option<String>,
 
     /// Penalty to be applied for repeating tokens, 1. means no penalty.
     #[arg(long, default_value_t = 1.1)]
@@ -243,11 +219,8 @@ struct Args {
     repeat_last_n: usize,
 
     /// The model to use.
-    #[arg(long, default_value = "2b")]
+    #[arg(long, default_value = "2-2b")]
     which: Which,
-
-    #[arg(long, default_value_t = 1)]
-    batch_size: usize,
 
     #[arg(long)]
     use_flash_attn: bool,
@@ -298,6 +271,7 @@ fn main() -> Result<()> {
             Which::InstructV2_2B => "google/gemma-2-2b-it".to_string(),
             Which::BaseV2_9B => "google/gemma-2-9b".to_string(),
             Which::InstructV2_9B => "google/gemma-2-9b-it".to_string(),
+            Which::BaseV3_1B => "google/gemma-3-1b-pt".to_string(),
         },
     };
     let repo = api.repo(Repo::with_revision(
@@ -305,39 +279,63 @@ fn main() -> Result<()> {
         RepoType::Model,
         args.revision,
     ));
-    let tokenizer_filename = match &args.weight_path {
-        Some(path) => Path::new(path).join("tokenizer.json"),
+    let tokenizer_filename = match args.tokenizer_file {
+        Some(file) => std::path::PathBuf::from(file),
         None => repo.get("tokenizer.json")?,
     };
-    let config_filename = match &args.weight_path {
-        Some(path) => Path::new(&path).join("config.json"),
+    let config_filename = match args.config_file {
+        Some(file) => std::path::PathBuf::from(file),
         None => repo.get("config.json")?,
     };
-    let filenames = match &args.weight_path {
-        Some(path) => {
-            candle_examples::hub_load_local_safetensors(path, "model.safetensors.index.json")?
+    let filenames = match args.weight_files {
+        Some(files) => files
+            .split(',')
+            .map(std::path::PathBuf::from)
+            .collect::<Vec<_>>(),
+        None => {
+            if args.which == Which::BaseV3_1B {
+                vec![repo.get("model.safetensors")?]
+            } else {
+                candle_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?
+            }
         }
-        None => candle_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?,
     };
     println!("retrieved the files in {:?}", start.elapsed());
     let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
 
     let start = std::time::Instant::now();
     let device = candle_examples::device(args.cpu)?;
-    let dtype = if device.is_cuda() || device.is_gcu() {
+    let dtype = if device.is_cuda() {
         DType::BF16
     } else {
         DType::F32
     };
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
-    let model = if args.which.is_v1() {
-        let config: Config1 = serde_json::from_reader(std::fs::File::open(config_filename)?)?;
-        let model = Model1::new(args.use_flash_attn, &config, vb)?;
-        Model::V1(model)
-    } else {
-        let config: Config2 = serde_json::from_reader(std::fs::File::open(config_filename)?)?;
-        let model = Model2::new(args.use_flash_attn, &config, vb)?;
-        Model::V2(model)
+    let model = match args.which {
+        Which::Base2B
+        | Which::Base7B
+        | Which::Instruct2B
+        | Which::Instruct7B
+        | Which::InstructV1_1_2B
+        | Which::InstructV1_1_7B
+        | Which::CodeBase2B
+        | Which::CodeBase7B
+        | Which::CodeInstruct2B
+        | Which::CodeInstruct7B => {
+            let config: Config1 = serde_json::from_reader(std::fs::File::open(config_filename)?)?;
+            let model = Model1::new(args.use_flash_attn, &config, vb)?;
+            Model::V1(model)
+        }
+        Which::BaseV2_2B | Which::InstructV2_2B | Which::BaseV2_9B | Which::InstructV2_9B => {
+            let config: Config2 = serde_json::from_reader(std::fs::File::open(config_filename)?)?;
+            let model = Model2::new(args.use_flash_attn, &config, vb)?;
+            Model::V2(model)
+        }
+        Which::BaseV3_1B => {
+            let config: Config3 = serde_json::from_reader(std::fs::File::open(config_filename)?)?;
+            let model = Model3::new(args.use_flash_attn, &config, vb)?;
+            Model::V3(model)
+        }
     };
 
     println!("loaded the model in {:?}", start.elapsed());
@@ -352,6 +350,6 @@ fn main() -> Result<()> {
         args.repeat_last_n,
         &device,
     );
-    pipeline.run(&args.prompt, args.sample_len, args.batch_size)?;
+    pipeline.run(&args.prompt, args.sample_len)?;
     Ok(())
 }

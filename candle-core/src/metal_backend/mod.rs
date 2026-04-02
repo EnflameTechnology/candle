@@ -265,6 +265,7 @@ impl BackendStorage for MetalStorage {
 
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, sum_dims: &[usize]) -> Result<Self> {
         let device = self.device.clone();
+
         let src_stride = layout.stride();
         let src_dims = layout.shape().dims();
         // Source dims and strides with the sum dims at the end.
@@ -278,13 +279,72 @@ impl BackendStorage for MetalStorage {
                 stride.push(src_stride[dim_idx]);
             }
         }
+
         for &dim_idx in sum_dims.iter() {
             dims.push(src_dims[dim_idx]);
             stride.push(src_stride[dim_idx]);
         }
 
-        // The reduction loop requires the shared array to be properly initialized and for
-        // this we want the number of threads to be a power of two.
+        let reduction_shape = Shape::from(dims.clone());
+
+        if layout.is_contiguous() && reduction_shape.is_contiguous(&stride) {
+            let (name, check_empty, return_index) = match (op, self.dtype) {
+                (ReduceOp::Sum, DType::F32) => ("fast_sum_f32", false, false),
+                (ReduceOp::Min, DType::F32) => ("fast_min_f32", true, false),
+                (ReduceOp::Max, DType::F32) => ("fast_max_f32", true, false),
+                (ReduceOp::ArgMin, DType::F32) => ("fast_argmin_f32", true, true),
+                (ReduceOp::ArgMax, DType::F32) => ("fast_argmax_f32", true, true),
+                (ReduceOp::Sum, DType::U32) => ("fast_sum_u32", false, false),
+                (ReduceOp::Min, DType::U32) => ("fast_min_u32", true, false),
+                (ReduceOp::Max, DType::U32) => ("fast_max_u32", true, false),
+                (ReduceOp::ArgMin, DType::U32) => ("fast_argmin_u32", true, true),
+                (ReduceOp::ArgMax, DType::U32) => ("fast_argmax_u32", true, true),
+                (ReduceOp::Sum, DType::F16) => ("fast_sum_f16", false, false),
+                (ReduceOp::Min, DType::F16) => ("fast_min_f16", true, false),
+                (ReduceOp::Max, DType::F16) => ("fast_max_f16", true, false),
+                (ReduceOp::ArgMin, DType::F16) => ("fast_argmin_f16", true, true),
+                (ReduceOp::ArgMax, DType::F16) => ("fast_argmax_f16", true, true),
+                (ReduceOp::Sum, DType::BF16) => ("fast_sum_bf16", false, false),
+                (ReduceOp::Min, DType::BF16) => ("fast_min_bf16", true, false),
+                (ReduceOp::Max, DType::BF16) => ("fast_max_bf16", true, false),
+                (ReduceOp::ArgMin, DType::BF16) => ("fast_argmin_bf16", true, true),
+                (ReduceOp::ArgMax, DType::BF16) => ("fast_argmax_bf16", true, true),
+                (ReduceOp::Sum, DType::I64) => ("fast_sum_i64", false, false),
+                (ReduceOp::Min, DType::I64) => ("fast_min_i64", true, false),
+                (ReduceOp::Max, DType::I64) => ("fast_max_i64", true, false),
+                (ReduceOp::ArgMin, DType::I64) => ("fast_argmin_i64", true, true),
+                (ReduceOp::ArgMax, DType::I64) => ("fast_argmax_i64", true, true),
+                (ReduceOp::Sum, DType::U8) => ("fast_sum_u8", false, false),
+                (ReduceOp::Min, DType::U8) => ("fast_min_u8", true, false),
+                (ReduceOp::Max, DType::U8) => ("fast_max_u8", true, false),
+                (ReduceOp::ArgMin, DType::U8) => ("fast_argmin_u8", true, true),
+                (ReduceOp::ArgMax, DType::U8) => ("fast_argmax_u8", true, true),
+                (k, dtype) => {
+                    crate::bail!("Metal contiguous reduce op {k:?} {dtype:?} not implemented")
+                }
+            };
+            if check_empty && layout.shape().elem_count() == 0 {
+                Err(crate::Error::EmptyTensor { op: "reduce" }.bt())?
+            }
+            let dtype = if return_index { DType::U32 } else { self.dtype };
+            let buffer = device.new_buffer(dst_el, dtype, "reduce")?;
+            let command_buffer = self.device.command_buffer()?;
+            let src = buffer_o(&self.buffer, layout, self.dtype);
+            candle_metal_kernels::call_reduce_contiguous(
+                &device.device,
+                &command_buffer,
+                &device.kernels,
+                name,
+                src_dims,
+                dst_el,
+                src,
+                &buffer,
+            )
+            .map_err(MetalError::from)?;
+
+            return Ok(Self::new(buffer, device, dst_el, dtype));
+        }
+
         let (name, check_empty, return_index) = match (op, self.dtype) {
             (ReduceOp::Sum, DType::F32) => ("fast_sum_f32_strided", false, false),
             (ReduceOp::Min, DType::F32) => ("fast_min_f32_strided", true, false),
@@ -316,7 +376,7 @@ impl BackendStorage for MetalStorage {
             (ReduceOp::Max, DType::U8) => ("fast_max_u8_strided", true, false),
             (ReduceOp::ArgMin, DType::U8) => ("fast_argmin_u8_strided", true, true),
             (ReduceOp::ArgMax, DType::U8) => ("fast_argmax_u8_strided", true, true),
-            (k, dtype) => crate::bail!("Metal reduce op {k:?} {dtype:?} not implemented"),
+            (k, dtype) => crate::bail!("Metal strided reduce op {k:?} {dtype:?} not implemented"),
         };
         if check_empty && layout.shape().elem_count() == 0 {
             Err(crate::Error::EmptyTensor { op: "reduce" }.bt())?
@@ -834,7 +894,9 @@ impl BackendStorage for MetalStorage {
             col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?
         } else {
             // Make the kernel contiguous if not already the case.
-            let mut kernel_c = self.device().zeros_impl(kernel_l.shape(), kernel.dtype())?;
+            let mut kernel_c = self
+                .device()
+                .zeros_impl(kernel_l.shape(), kernel.dtype(), false)?;
             kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
             let kernel_l = Layout::contiguous_with_offset((1, n, k), kernel_l.start_offset())
                 .transpose(1, 2)?
@@ -842,7 +904,9 @@ impl BackendStorage for MetalStorage {
             col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?
         };
         let res_l = Layout::contiguous((b, l_out, n)).transpose(1, 2)?;
-        let mut res_t = self.device().zeros_impl(res_l.shape(), res.dtype())?;
+        let mut res_t = self
+            .device()
+            .zeros_impl(res_l.shape(), res.dtype(), false)?;
         res.copy_strided_src(&mut res_t, 0, &res_l)?;
         Ok(res_t)
     }
@@ -1025,7 +1089,9 @@ impl BackendStorage for MetalStorage {
             col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?
         } else {
             // Make the kernel contiguous if not already the case.
-            let mut kernel_c = self.device().zeros_impl(kernel_l.shape(), kernel.dtype())?;
+            let mut kernel_c = self
+                .device()
+                .zeros_impl(kernel_l.shape(), kernel.dtype(), false)?;
             kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
             let kernel_l = Layout::contiguous_with_offset((1, n, k), kernel_l.start_offset())
                 .transpose(1, 2)?
@@ -1035,7 +1101,9 @@ impl BackendStorage for MetalStorage {
         let res_l = Layout::contiguous((b, h_out, w_out, n))
             .transpose(1, 2)?
             .transpose(1, 3)?;
-        let mut res_t = self.device().zeros_impl(res_l.shape(), res.dtype())?;
+        let mut res_t = self
+            .device()
+            .zeros_impl(res_l.shape(), res.dtype(), false)?;
         res.copy_strided_src(&mut res_t, 0, &res_l)?;
         Ok(res_t)
     }
@@ -1245,6 +1313,12 @@ impl BackendStorage for MetalStorage {
             (DType::U32, DType::F16) => "gather_u32_f16",
             (DType::U32, DType::BF16) => "gather_u32_bf16",
             (DType::U32, DType::U32) => "gather_u32_u32",
+            (DType::U32, DType::I64) => "gather_u32_i64",
+            (DType::I64, DType::F32) => "gather_i64_f32",
+            (DType::I64, DType::F16) => "gather_i64_f16",
+            (DType::I64, DType::BF16) => "gather_i64_bf16",
+            (DType::I64, DType::U32) => "gather_i64_u32",
+            (DType::I64, DType::I64) => "gather_i64_i64",
             (left, right) => crate::bail!("Metal gather {left:?} {right:?} not implemented"),
         };
         let command_buffer = self.device.command_buffer()?;
@@ -1275,7 +1349,7 @@ impl BackendStorage for MetalStorage {
         src_l: &Layout,
         dim: usize,
     ) -> Result<Self> {
-        let mut acc = self.device.zeros_impl(l.shape(), self.dtype())?;
+        let mut acc = self.device.zeros_impl(l.shape(), self.dtype(), false)?;
         self.copy_strided_src(&mut acc, 0, l)?;
         if !ids_l.is_contiguous() || !src_l.is_contiguous() {
             return Err(crate::Error::RequiresContiguous { op: "scatter-add" }.bt());
@@ -1384,7 +1458,7 @@ impl BackendStorage for MetalStorage {
         src_l: &Layout,
         dim: usize,
     ) -> Result<Self> {
-        let mut acc = self.device.zeros_impl(l.shape(), self.dtype())?;
+        let mut acc = self.device.zeros_impl(l.shape(), self.dtype(), false)?;
         self.copy_strided_src(&mut acc, 0, l)?;
         if !ids_l.is_contiguous() || !src_l.is_contiguous() {
             return Err(crate::Error::RequiresContiguous { op: "index-add" }.bt());
@@ -1436,6 +1510,7 @@ impl BackendStorage for MetalStorage {
         .map_err(MetalError::from)?;
         Ok(acc)
     }
+
     fn matmul(
         &self,
         rhs: &Self,
@@ -1462,7 +1537,7 @@ impl BackendStorage for MetalStorage {
                 &buffer,
             )
             .map_err(MetalError::from)?;
-        } else if self.device.use_mlx_mm {
+        } else {
             let dtype = match self.dtype {
                 DType::F32 => candle_metal_kernels::GemmDType::F32,
                 DType::F16 => candle_metal_kernels::GemmDType::F16,
@@ -1479,32 +1554,6 @@ impl BackendStorage for MetalStorage {
                 &command_buffer,
                 &self.device.kernels,
                 dtype,
-                (b, m, n, k),
-                lhs_l.stride(),
-                lhs_l.start_offset() * self.dtype.size_in_bytes(),
-                &self.buffer,
-                rhs_l.stride(),
-                rhs_l.start_offset() * rhs.dtype.size_in_bytes(),
-                &rhs.buffer,
-                &buffer,
-            )
-            .map_err(MetalError::from)?;
-        } else {
-            let name = match self.dtype {
-                DType::F32 => "sgemm",
-                DType::F16 => "hgemm",
-                dtype => {
-                    return Err(
-                        MetalError::Message(format!("matmul doesn't support {dtype:?}")).into(),
-                    )
-                }
-            };
-
-            candle_metal_kernels::call_gemm(
-                &self.device.device,
-                &command_buffer,
-                &self.device.kernels,
-                name,
                 (b, m, n, k),
                 lhs_l.stride(),
                 lhs_l.start_offset() * self.dtype.size_in_bytes(),
@@ -1877,10 +1926,6 @@ impl BackendDevice for MetalDevice {
         let device = metal::Device::all().swap_remove(ordinal);
         let command_queue = device.new_command_queue();
         let kernels = Arc::new(Kernels::new());
-        let use_mlx_mm = match std::env::var("CANDLE_USE_MFA_MM").as_deref() {
-            Ok("false") | Ok("False") | Ok("FALSE") | Ok("0") | Err(_) => true,
-            Ok(_) => false,
-        };
         let seed = Arc::new(Mutex::new(device.new_buffer_with_data(
             [299792458].as_ptr() as *const c_void,
             4,
@@ -1894,7 +1939,6 @@ impl BackendDevice for MetalDevice {
             buffers: Arc::new(RwLock::new(HashMap::new())),
             kernels,
             seed,
-            use_mlx_mm,
         })
     }
 
@@ -1918,9 +1962,9 @@ impl BackendDevice for MetalDevice {
         ))
     }
 
-    fn zeros_impl(&self, shape: &Shape, dtype: DType) -> Result<MetalStorage> {
+    fn zeros_impl(&self, shape: &Shape, dtype: DType, sync_alloc: bool) -> Result<MetalStorage> {
         let size = shape.elem_count() * dtype.size_in_bytes();
-        let buffer = self.allocate_zeros(size)?;
+        let buffer = self.allocate_zeros(size, sync_alloc)?;
         Ok(MetalStorage::new(
             buffer,
             self.clone(),

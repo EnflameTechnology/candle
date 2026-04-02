@@ -58,8 +58,7 @@ impl Config {
 
 #[derive(Debug, Clone)]
 struct RotaryEmbedding {
-    pub cache: Tensor,
-    pub cos_sin: Tensor,
+    cache: Tensor,
 }
 
 impl RotaryEmbedding {
@@ -76,9 +75,8 @@ impl RotaryEmbedding {
             .to_dtype(dtype)?
             .reshape((cfg.seq_length, 1))?;
         let freqs = t.matmul(&inv_freq)?;
-        let cos_sin = Tensor::cat(&[&freqs.cos()?, &freqs.sin()?], D::Minus1)?; //must be contiguous tensor;
         let cache = Tensor::stack(&[&freqs.cos()?, &freqs.sin()?], D::Minus1)?;
-        Ok(Self { cache, cos_sin })
+        Ok(Self { cache })
     }
 
     fn apply(&self, xs: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
@@ -150,17 +148,14 @@ impl CoreAttention {
             query_layer.reshape((output_size.2, output_size.0 * output_size.1, ()))?;
         let key_layer = key_layer.reshape((output_size.3, output_size.0 * output_size.1, ()))?;
         let matmul_result = Tensor::matmul(
-            &query_layer.transpose(0, 1)?.contiguous()?,
-            &key_layer.transpose(0, 1)?.transpose(1, 2)?.contiguous()?, //multi-level transpose to contiguous tensor
+            &query_layer.transpose(0, 1)?,
+            &key_layer.transpose(0, 1)?.transpose(1, 2)?,
         )?;
         let matmul_result = (matmul_result / self.norm_factor)?.reshape(output_size)?;
         let matmul_result = match self.coeff {
             None => matmul_result,
             Some(coeff) => (matmul_result * coeff)?,
         };
-
-        let dtype = query_layer.dtype();
-        let matmul_result = matmul_result.to_dtype(DType::F32)?; //for precision
         let attention_scores = match attention_mask {
             Some(mask) => masked_fill(
                 &matmul_result,
@@ -169,8 +164,7 @@ impl CoreAttention {
             )?,
             None => matmul_result,
         };
-        let attention_probs =
-            candle_nn::ops::softmax_last_dim(&attention_scores)?.to_dtype(dtype)?;
+        let attention_probs = candle_nn::ops::softmax_last_dim(&attention_scores)?;
 
         let output_size = (
             value_layer.dim(1)?,
@@ -182,10 +176,7 @@ impl CoreAttention {
             value_layer.reshape((value_layer.dim(0)?, output_size.0 * output_size.1, ()))?;
         let attention_probs =
             attention_probs.reshape((output_size.0 * output_size.1, output_size.2, ()))?;
-        let context_layer = Tensor::matmul(
-            &attention_probs,
-            &value_layer.transpose(0, 1)?.contiguous()?,
-        )?; //Transposed weight supported on GCU, but not dim0 <-> dim1
+        let context_layer = Tensor::matmul(&attention_probs, &value_layer.transpose(0, 1)?)?;
         let context_layer = context_layer.reshape(output_size)?;
         let context_layer = context_layer.permute((2, 0, 1, 3))?.contiguous()?;
         context_layer.flatten_from(D::Minus2)
@@ -290,31 +281,15 @@ impl SelfAttention {
             None => 0,
             Some((prev_k, _)) => prev_k.dim(0)?,
         };
-        // let query_layer = rotary_emb.apply(&query_layer, seqlen_offset)?;
-        // let key_layer = rotary_emb.apply(&key_layer, seqlen_offset)?;
-
-        let rot_dim = rotary_emb.cache.dim(D::Minus2)? * 2;
-        #[cfg(feature = "gcu")]
-        let seqlen_offset = Tensor::new(seqlen_offset as i64, &xs.device())?;
-        let (query_layer, key_layer) = candle_nn::ops::apply_rotary_emb_qkv(
-            &query_layer,
-            &key_layer,
-            &rotary_emb.cos_sin,
-            &rotary_emb.cache,
-            &seqlen_offset,
-            rot_dim,
-            false,
-            false,
-        )?;
+        let query_layer = rotary_emb.apply(&query_layer, seqlen_offset)?;
+        let key_layer = rotary_emb.apply(&key_layer, seqlen_offset)?;
 
         // KV cache.
         let (key_layer, value_layer) = match &self.kv_cache {
             None => (key_layer, value_layer),
             Some((prev_k, prev_v)) => {
-                // let k = Tensor::cat(&[prev_k, &key_layer], 0)?;
-                // let v = Tensor::cat(&[prev_v, &value_layer], 0)?;
-                let k = candle_nn::ops::kvconcat(prev_k, &key_layer, 0)?; //kv concat on dim0
-                let v = candle_nn::ops::kvconcat(prev_v, &value_layer, 0)?;
+                let k = Tensor::cat(&[prev_k, &key_layer], 0)?;
+                let v = Tensor::cat(&[prev_v, &value_layer], 0)?;
                 (k, v)
             }
         };

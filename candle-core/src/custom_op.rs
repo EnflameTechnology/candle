@@ -20,7 +20,7 @@ pub trait CustomOp1 {
         ))
     }
 
-    /// The forward pass, as run on a gpu device. Note that the storage can use arbitrary strides,
+    /// The forward pass, as run on a gcu device. Note that the storage can use arbitrary strides,
     /// offsets etc so the associated layout should be used to access it.
     fn gcu_fwd(&self, _storage: &GcuStorage, _layout: &Layout) -> Result<(GcuStorage, Shape)> {
         Err(crate::Error::Gcu(
@@ -75,8 +75,6 @@ pub trait CustomOp2 {
         ))
     }
 
-    /// The forward pass, as run on a gpu device. Note that the storage can use arbitrary strides,
-    /// offsets etc so the associated layout should be used to access it.
     fn gcu_fwd(
         &self,
         _: &GcuStorage,
@@ -145,8 +143,6 @@ pub trait CustomOp3 {
         ))
     }
 
-    /// The forward pass, as run on a gpu device. Note that the storage can use arbitrary strides,
-    /// offsets etc so the associated layout should be used to access it.
     fn gcu_fwd(
         &self,
         _: &GcuStorage,
@@ -301,8 +297,6 @@ pub trait InplaceOp1 {
         ))
     }
 
-    /// The forward pass, as run on a gpu device. Note that the storage can use arbitrary strides,
-    /// offsets etc so the associated layout should be used to access it.
     fn gcu_fwd(&self, _storage: &mut GcuStorage, _layout: &Layout) -> Result<()> {
         Err(crate::Error::Gcu(
             format!("no gcu implementation for {}", self.name()).into(),
@@ -334,8 +328,6 @@ pub trait InplaceOp2 {
         ))
     }
 
-    /// The forward pass, as run on a gpu device. Note that the storage can use arbitrary strides,
-    /// offsets etc so the associated layout should be used to access it.
     fn gcu_fwd(&self, _: &mut GcuStorage, _: &Layout, _: &GcuStorage, _: &Layout) -> Result<()> {
         Err(crate::Error::Gcu(
             format!("no gcu implementation for {}", self.name()).into(),
@@ -388,8 +380,6 @@ pub trait InplaceOp3 {
         ))
     }
 
-    /// The forward pass, as run on a gpu device. Note that the storage can use arbitrary strides,
-    /// offsets etc so the associated layout should be used to access it.
     fn gcu_fwd(
         &self,
         _: &mut GcuStorage,
@@ -443,112 +433,5 @@ impl Tensor {
             t3.layout(),
             c,
         )
-    }
-}
-
-pub struct UgIOp1 {
-    name: &'static str,
-    #[cfg(feature = "cuda")]
-    func: cudarc::driver::CudaFunction,
-    #[cfg(feature = "metal")]
-    func: metal::ComputePipelineState,
-}
-
-impl UgIOp1 {
-    #[allow(unused)]
-    pub fn new(
-        name: &'static str,
-        kernel: ug::lang::ssa::Kernel,
-        device: &crate::Device,
-    ) -> Result<Self> {
-        #[cfg(feature = "cuda")]
-        {
-            let device = device.as_cuda_device()?;
-            let func = device.compile(name, kernel)?;
-            Ok(Self { name, func })
-        }
-        #[cfg(feature = "metal")]
-        {
-            let device = device.as_metal_device()?;
-            let func = device.compile(name, kernel)?;
-            Ok(Self { name, func })
-        }
-        #[cfg(not(any(feature = "cuda", feature = "metal")))]
-        {
-            Ok(Self { name })
-        }
-    }
-}
-
-impl InplaceOp1 for UgIOp1 {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-
-    fn cpu_fwd(&self, _: &mut CpuStorage, _: &Layout) -> Result<()> {
-        crate::bail!("ug ops are only supported on metal/cuda at the moment")
-    }
-
-    #[cfg(feature = "metal")]
-    fn metal_fwd(&self, sto: &mut MetalStorage, layout: &Layout) -> Result<()> {
-        use crate::backend::BackendStorage;
-        use candle_metal_kernels::utils::EncoderProvider;
-
-        let elem_count = layout.shape().elem_count();
-        if sto.dtype() != crate::DType::F32 {
-            // TODO: support more dtypes.
-            crate::bail!("input is not a f32 tensor")
-        }
-        let device = sto.device();
-        println!("here");
-        let command_buffer = device.command_buffer()?;
-        let command_buffer = &command_buffer;
-        let encoder = command_buffer.encoder();
-        let encoder = encoder.as_ref();
-        encoder.set_compute_pipeline_state(&self.func);
-        let (g, b) = if elem_count % 32 == 0 {
-            (elem_count / 32, 32)
-        } else {
-            (elem_count, 1)
-        };
-        let grid_dims = metal::MTLSize {
-            width: g as u64,
-            height: 1,
-            depth: 1,
-        };
-        let group_dims = candle_metal_kernels::utils::get_block_dims(b as u64, 1, 1);
-        candle_metal_kernels::utils::set_param(encoder, 0, (sto.buffer(), 0usize));
-
-        encoder.use_resource(sto.buffer(), metal::MTLResourceUsage::Write);
-        encoder.dispatch_threads(grid_dims, group_dims);
-
-        Ok(())
-    }
-
-    #[cfg(feature = "cuda")]
-    fn cuda_fwd(&self, sto: &mut CudaStorage, layout: &Layout) -> Result<()> {
-        use crate::cuda_backend::WrapErr;
-        use cudarc::driver::LaunchAsync;
-
-        let elem_count = layout.shape().elem_count();
-        // TODO: support more dtypes.
-        let sto = sto.as_cuda_slice::<f32>()?;
-        let sto = match layout.contiguous_offsets() {
-            None => crate::bail!("input has to be contiguous"),
-            Some((o1, o2)) => sto.slice(o1..o2),
-        };
-        let params = (&sto,);
-        let (g, b) = if elem_count % 32 == 0 {
-            (elem_count / 32, 32)
-        } else {
-            (elem_count, 1)
-        };
-        let cfg = cudarc::driver::LaunchConfig {
-            grid_dim: (g as u32, 1, 1),
-            block_dim: (b as u32, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe { self.func.clone().launch(cfg, params) }.w()?;
-        Ok(())
     }
 }

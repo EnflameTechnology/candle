@@ -5,13 +5,13 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use anyhow::{Error as E, Result};
+use clap::{Parser, ValueEnum};
+
 use candle_examples::token_output_stream::TokenOutputStream;
 use candle_transformers::models::mixformer::{Config, MixFormerSequentialForCausalLM as MixFormer};
 use candle_transformers::models::phi::{Config as PhiConfig, Model as Phi};
 use candle_transformers::models::phi3::{Config as Phi3Config, Model as Phi3};
 use candle_transformers::models::quantized_mixformer::MixFormerSequentialForCausalLM as QMixFormer;
-use clap::{Parser, ValueEnum};
-use std::path::Path;
 
 use candle::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
@@ -61,7 +61,7 @@ impl TextGeneration {
         }
     }
 
-    fn run(&mut self, prompt: &str, sample_len: usize, batch_size: usize) -> Result<()> {
+    fn run(&mut self, prompt: &str, sample_len: usize) -> Result<()> {
         use std::io::Write;
         println!("starting the inference loop");
         let tokens = self
@@ -86,34 +86,17 @@ impl TextGeneration {
         };
         print!("{prompt}");
         std::io::stdout().flush()?;
-        let mut start_gen = std::time::Instant::now();
+        let start_gen = std::time::Instant::now();
         let mut pos = 0;
         for index in 0..sample_len {
             let context_size = if index > 0 { 1 } else { tokens.len() };
-            if index == 1 {
-                start_gen = std::time::Instant::now()
-            }
             let ctxt = &tokens[tokens.len().saturating_sub(context_size)..];
-            let input = Tensor::new(ctxt, &self.device)?;
-            let input = if batch_size > 1 {
-                let dims = input.layout().dims();
-                input
-                    .broadcast_as((batch_size, if dims.len() > 1 { dims[1] } else { dims[0] }))?
-                    .contiguous()?
-            } else {
-                input.unsqueeze(0)?
-            };
-
+            let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
             let logits = match &mut self.model {
                 Model::MixFormer(m) => m.forward(&input)?,
                 Model::Phi(m) => m.forward(&input)?,
                 Model::Quantized(m) => m.forward(&input)?,
-                Model::Phi3(m) => m.forward(&input, pos)?,
-            };
-            let logits = if batch_size > 1 {
-                logits.narrow(0, 0, 1)?
-            } else {
-                logits
+                Model::Phi3(m) => m.forward(&input, pos)?.i((.., 0, ..))?,
             };
             let logits = logits.squeeze(0)?.to_dtype(DType::F32)?;
             let logits = if self.repeat_penalty == 1. {
@@ -144,10 +127,9 @@ impl TextGeneration {
             pos += context_size;
         }
         let dt = start_gen.elapsed();
-        let throughput_per_req = (generated_tokens - 1) as f64 / dt.as_secs_f64();
         println!(
-            "\n{} tokens generated ({} x {generated_tokens} tokens), throughput: {:.2} token/s ({} x {:.2} token/s)", generated_tokens * batch_size,
-            batch_size, throughput_per_req * batch_size as f64, batch_size, throughput_per_req
+            "\n{generated_tokens} tokens generated ({:.2} token/s)",
+            generated_tokens as f64 / dt.as_secs_f64(),
         );
         Ok(())
     }
@@ -166,6 +148,8 @@ enum WhichModel {
     #[value(name = "3-medium")]
     V3Medium,
     #[value(name = "2-old")]
+    V4Mini,
+    #[value(name = "4-mini")]
     V2Old,
     PuffinPhiV2,
     PhiHermes,
@@ -218,7 +202,7 @@ struct Args {
     revision: Option<String>,
 
     #[arg(long)]
-    weight_path: Option<String>,
+    weight_file: Option<String>,
 
     #[arg(long)]
     tokenizer: Option<String>,
@@ -233,9 +217,6 @@ struct Args {
     /// The context size to consider for the repeat penalty.
     #[arg(long, default_value_t = 64)]
     repeat_last_n: usize,
-
-    #[arg(long, default_value_t = 1)]
-    batch_size: usize,
 
     /// The dtype to be used for running the model, e.g. f32, bf16, or f16.
     #[arg(long)]
@@ -282,6 +263,7 @@ fn main() -> Result<()> {
                     WhichModel::V2 | WhichModel::V2Old => "microsoft/phi-2".to_string(),
                     WhichModel::V3 => "microsoft/Phi-3-mini-4k-instruct".to_string(),
                     WhichModel::V3Medium => "microsoft/Phi-3-medium-4k-instruct".to_string(),
+                    WhichModel::V4Mini => "microsoft/Phi-4-mini-instruct".to_string(),
                     WhichModel::PuffinPhiV2 | WhichModel::PhiHermes => {
                         "lmz/candle-quantized-phi".to_string()
                     }
@@ -302,6 +284,7 @@ fn main() -> Result<()> {
                     WhichModel::V2
                     | WhichModel::V3
                     | WhichModel::V3Medium
+                    | WhichModel::V4Mini
                     | WhichModel::PuffinPhiV2
                     | WhichModel::PhiHermes => "main".to_string(),
                 }
@@ -309,52 +292,49 @@ fn main() -> Result<()> {
         }
     };
     let repo = api.repo(Repo::with_revision(model_id, RepoType::Model, revision));
-    let tokenizer_filename = match &args.weight_path {
-        Some(path) => repo.get("tokenizer.json")?,
+    let tokenizer_filename = match args.tokenizer {
+        Some(file) => std::path::PathBuf::from(file),
         None => match args.model {
             WhichModel::V1
             | WhichModel::V1_5
             | WhichModel::V2
             | WhichModel::V2Old
             | WhichModel::V3
-            | WhichModel::V3Medium => repo.get("tokenizer.json")?,
+            | WhichModel::V3Medium
+            | WhichModel::V4Mini => repo.get("tokenizer.json")?,
             WhichModel::PuffinPhiV2 | WhichModel::PhiHermes => {
                 repo.get("tokenizer-puffin-phi-v2.json")?
             }
         },
     };
-    let filenames = {
-        if args.quantized {
-            match args.model {
-                WhichModel::V1 => vec![repo.get("model-v1-q4k.gguf")?],
-                WhichModel::V1_5 => vec![repo.get("model-q4k.gguf")?],
-                WhichModel::V2 | WhichModel::V2Old => vec![repo.get("model-v2-q4k.gguf")?],
-                WhichModel::PuffinPhiV2 => vec![repo.get("model-puffin-phi-v2-q4k.gguf")?],
-                WhichModel::PhiHermes => vec![repo.get("model-phi-hermes-1_3B-q4k.gguf")?],
-                WhichModel::V3 | WhichModel::V3Medium => anyhow::bail!(
-                    "use the quantized or quantized-phi examples for quantized phi-v3"
-                ),
-            }
-        } else {
-            match args.model {
-                WhichModel::V1 | WhichModel::V1_5 => match &args.weight_path {
-                    Some(path) => vec![Path::new(path).join("model.safetensors")],
-                    None => vec![repo.get("model.safetensors")?],
-                },
-                WhichModel::V2 | WhichModel::V2Old | WhichModel::V3 | WhichModel::V3Medium => {
-                    match &args.weight_path {
-                        Some(path) => candle_examples::hub_load_local_safetensors(
-                            path,
-                            "model.safetensors.index.json",
-                        )?,
-                        None => candle_examples::hub_load_safetensors(
-                            &repo,
-                            "model.safetensors.index.json",
-                        )?,
-                    }
+    let filenames = match args.weight_file {
+        Some(weight_file) => vec![std::path::PathBuf::from(weight_file)],
+        None => {
+            if args.quantized {
+                match args.model {
+                    WhichModel::V1 => vec![repo.get("model-v1-q4k.gguf")?],
+                    WhichModel::V1_5 => vec![repo.get("model-q4k.gguf")?],
+                    WhichModel::V2 | WhichModel::V2Old => vec![repo.get("model-v2-q4k.gguf")?],
+                    WhichModel::PuffinPhiV2 => vec![repo.get("model-puffin-phi-v2-q4k.gguf")?],
+                    WhichModel::PhiHermes => vec![repo.get("model-phi-hermes-1_3B-q4k.gguf")?],
+                    WhichModel::V3 | WhichModel::V3Medium | WhichModel::V4Mini => anyhow::bail!(
+                        "use the quantized or quantized-phi examples for quantized phi-v3"
+                    ),
                 }
-                WhichModel::PuffinPhiV2 => vec![repo.get("model-puffin-phi-v2.safetensors")?],
-                WhichModel::PhiHermes => vec![repo.get("model-phi-hermes-1_3B.safetensors")?],
+            } else {
+                match args.model {
+                    WhichModel::V1 | WhichModel::V1_5 => vec![repo.get("model.safetensors")?],
+                    WhichModel::V2
+                    | WhichModel::V2Old
+                    | WhichModel::V3
+                    | WhichModel::V3Medium
+                    | WhichModel::V4Mini => candle_examples::hub_load_safetensors(
+                        &repo,
+                        "model.safetensors.index.json",
+                    )?,
+                    WhichModel::PuffinPhiV2 => vec![repo.get("model-puffin-phi-v2.safetensors")?],
+                    WhichModel::PhiHermes => vec![repo.get("model-phi-hermes-1_3B.safetensors")?],
+                }
             }
         }
     };
@@ -368,7 +348,7 @@ fn main() -> Result<()> {
         WhichModel::V2 | WhichModel::V2Old => Config::v2(),
         WhichModel::PuffinPhiV2 => Config::puffin_phi_v2(),
         WhichModel::PhiHermes => Config::phi_hermes_1_3b(),
-        WhichModel::V3 | WhichModel::V3Medium => {
+        WhichModel::V3 | WhichModel::V3Medium | WhichModel::V4Mini => {
             panic!("use the quantized or quantized-phi examples for quantized phi-v3")
         }
     };
@@ -385,31 +365,30 @@ fn main() -> Result<()> {
         };
         Model::Quantized(model)
     } else {
-        let dtype = if ((args.model == WhichModel::V3 || args.model == WhichModel::V3Medium)
-            && device.is_cuda())
-            || device.is_gcu()
-        {
-            DType::BF16
-        } else {
-            DType::F32
+        let dtype = match args.dtype {
+            Some(dtype) => std::str::FromStr::from_str(&dtype)?,
+            None => {
+                if args.model == WhichModel::V3
+                    || args.model == WhichModel::V3Medium
+                    || args.model == WhichModel::V4Mini
+                {
+                    device.bf16_default_to_f32()
+                } else {
+                    DType::F32
+                }
+            }
         };
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
         match args.model {
             WhichModel::V1 | WhichModel::V1_5 | WhichModel::V2 => {
-                let config_filename = match &args.weight_path {
-                    Some(path) => Path::new(path).join("config.json"),
-                    _ => repo.get("config.json")?,
-                };
+                let config_filename = repo.get("config.json")?;
                 let config = std::fs::read_to_string(config_filename)?;
                 let config: PhiConfig = serde_json::from_str(&config)?;
-                let phi = Phi::new(&config, dtype, vb)?;
+                let phi = Phi::new(&config, vb)?;
                 Model::Phi(phi)
             }
-            WhichModel::V3 | WhichModel::V3Medium => {
-                let config_filename = match &args.weight_path {
-                    Some(path) => Path::new(path).join("config.json"),
-                    _ => repo.get("config.json")?,
-                };
+            WhichModel::V3 | WhichModel::V3Medium | WhichModel::V4Mini => {
+                let config_filename = repo.get("config.json")?;
                 let config = std::fs::read_to_string(config_filename)?;
                 let config: Phi3Config = serde_json::from_str(&config)?;
                 let phi3 = Phi3::new(&config, vb)?;
@@ -443,7 +422,7 @@ fn main() -> Result<()> {
                 args.verbose_prompt,
                 &device,
             );
-            pipeline.run(&prompt, args.sample_len, args.batch_size)?;
+            pipeline.run(&prompt, args.sample_len)?;
         }
         (None, Some(mmlu_dir)) => mmlu(model, tokenizer, &device, mmlu_dir)?,
     }

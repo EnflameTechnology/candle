@@ -16,7 +16,7 @@
 //!
 
 use crate::models::with_tracing::{linear_no_bias, Linear, RmsNorm};
-use candle::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use candle::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::{Activation, VarBuilder};
 use std::sync::Arc;
 
@@ -70,7 +70,6 @@ impl Config {
 struct RotaryEmbedding {
     sin: Tensor,
     cos: Tensor,
-    cos_sin: Tensor,
 }
 
 fn rotate_half(xs: &Tensor) -> Result<Tensor> {
@@ -94,12 +93,10 @@ impl RotaryEmbedding {
             .to_dtype(dtype)?
             .reshape((max_seq_len, 1))?;
         let freqs = t.matmul(&inv_freq)?;
-        let cos_sin = Tensor::cat(&[&freqs.cos()?, &freqs.sin()?], D::Minus1)?; //must be contiguous tensor;
         let freqs = Tensor::cat(&[&freqs, &freqs], D::Minus1)?;
         Ok(Self {
             sin: freqs.sin()?,
             cos: freqs.cos()?,
-            cos_sin,
         })
     }
 
@@ -200,55 +197,31 @@ impl Attention {
         attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
-        let (b_sz, seq_len, _) = xs.dims3()?;
+        let (b_sz, q_len, _) = xs.dims3()?;
 
         let query_states = self.q_proj.forward(xs)?;
         let key_states = self.k_proj.forward(xs)?;
         let value_states = self.v_proj.forward(xs)?;
 
-        let (query_states, key_states, value_states) = if seq_len == 1 {
-            //no need transpose for seq_len == 1, change reshape dim
-            let q = query_states.reshape((b_sz, self.num_heads, seq_len, self.head_dim))?;
-            let k = key_states.reshape((b_sz, self.num_kv_heads, seq_len, self.head_dim))?;
-            let v = value_states.reshape((b_sz, self.num_kv_heads, seq_len, self.head_dim))?;
-            (q, k, v)
-        } else {
-            let q = query_states
-                .reshape((b_sz, seq_len, self.num_heads, self.head_dim))?
-                .transpose(1, 2)?;
-            let k = key_states
-                .reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?
-                .transpose(1, 2)?;
-            let v = value_states
-                .reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?
-                .transpose(1, 2)?;
-            (q, k, v.contiguous()?)
-        };
-        #[cfg(feature = "gcu")]
-        let seqlen_offset = Tensor::new(seqlen_offset as i64, &xs.device())?;
+        let query_states = query_states
+            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let key_states = key_states
+            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let value_states = value_states
+            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
 
-        let (query_states, key_states) = candle_nn::apply_rotary_emb_qkv(
-            &query_states,
-            &key_states,
-            if query_states.device().is_gcu() {
-                &self.rotary_emb.cos_sin
-            } else {
-                &self.rotary_emb.cos
-            },
-            &self.rotary_emb.sin,
-            &seqlen_offset,
-            0,
-            true,
-            true,
-        )?;
+        let (query_states, key_states) =
+            self.rotary_emb
+                .apply_rotary_emb_qkv(&query_states, &key_states, seqlen_offset)?;
 
         let (key_states, value_states) = match &self.kv_cache {
             None => (key_states, value_states),
             Some((prev_k, prev_v)) => {
-                // let key_states = Tensor::cat(&[prev_k, &key_states], 2)?;
-                // let value_states = Tensor::cat(&[prev_v, &value_states], 2)?;
-                let key_states = candle_nn::kvconcat(prev_k, &key_states, 2)?;
-                let value_states = candle_nn::kvconcat(prev_v, &value_states, 2)?;
+                let key_states = Tensor::cat(&[prev_k, &key_states], 2)?;
+                let value_states = Tensor::cat(&[prev_v, &value_states], 2)?;
                 (key_states, value_states)
             }
         };
@@ -270,7 +243,7 @@ impl Attention {
         };
         attn_output
             .transpose(1, 2)?
-            .reshape((b_sz, seq_len, self.hidden_size))?
+            .reshape((b_sz, q_len, self.hidden_size))?
             .apply(&self.o_proj)
     }
 }
@@ -384,7 +357,7 @@ impl Model {
         for layer in self.layers.iter_mut() {
             xs = layer.forward(&xs, attention_mask.as_ref(), seqlen_offset)?
         }
-        xs.i((.., seq_len - 1, ..))?
+        xs.narrow(1, seq_len - 1, 1)?
             .apply(&self.norm)?
             .apply(&self.lm_head)
     }

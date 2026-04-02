@@ -144,7 +144,6 @@ fn get_mask(size: usize, dtype: DType, device: &Device) -> Result<Tensor> {
 struct RotaryEmbedding {
     sin: Tensor,
     cos: Tensor,
-    cos_sin: Tensor,
 }
 
 impl RotaryEmbedding {
@@ -154,16 +153,14 @@ impl RotaryEmbedding {
             .map(|i| 1f32 / 10000f32.powf(i as f32 / dim as f32))
             .collect();
         let inv_freq_len = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(dtype)?;
+        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?;
         let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
-            .to_dtype(dtype)?
+            .to_dtype(DType::F32)?
             .reshape((max_seq_len, 1))?;
         let freqs = t.matmul(&inv_freq)?;
-        let cos_sin = Tensor::cat(&[&freqs.cos()?, &freqs.sin()?], D::Minus1)?.contiguous()?; //must be contiguous tensor;
         Ok(Self {
-            sin: freqs.sin()?,
-            cos: freqs.cos()?,
-            cos_sin,
+            sin: freqs.sin()?.to_dtype(dtype)?,
+            cos: freqs.cos()?.to_dtype(dtype)?,
         })
     }
 
@@ -199,6 +196,7 @@ struct MLP {
     fc1: Linear,
     fc2: Linear,
     act: Activation,
+    span: tracing::Span,
 }
 
 impl MLP {
@@ -210,12 +208,14 @@ impl MLP {
             fc1,
             fc2,
             act: cfg.activation_function,
+            span: tracing::span!(tracing::Level::TRACE, "mlp"),
         })
     }
 }
 
 impl Module for MLP {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let _enter = self.span.enter();
         xs.apply(&self.fc1)?.apply(&self.act)?.apply(&self.fc2)
     }
 }
@@ -252,6 +252,9 @@ struct MHA {
     head_dim: usize,
     softmax_scale: f64,
     span: tracing::Span,
+    span_rope: tracing::Span,
+    span_mask: tracing::Span,
+    span_softmax: tracing::Span,
 }
 
 impl MHA {
@@ -271,39 +274,10 @@ impl MHA {
             rotary_emb,
             softmax_scale,
             span: tracing::span!(tracing::Level::TRACE, "mha"),
+            span_rope: tracing::span!(tracing::Level::TRACE, "rope"),
+            span_mask: tracing::span!(tracing::Level::TRACE, "mask"),
+            span_softmax: tracing::span!(tracing::Level::TRACE, "softmax"),
         })
-    }
-    fn rotary_emb_qkv(
-        &self,
-        qkv: &Tensor,
-        seqlen_offset: usize,
-    ) -> Result<(Tensor, Tensor, Tensor)> {
-        let (b_sz, _, _, _, _) = qkv.dims5()?;
-        #[cfg(feature = "gcu")]
-        {
-            let q = qkv.i((.., .., 0))?;
-            let k = qkv.i((.., .., 1))?;
-            let v = qkv.i((.., .., 2))?;
-            let (_, rotary_dim) = self.rotary_emb.cos.dims2()?;
-            let rotary_dim = rotary_dim * 2;
-            let seqlen_offset = Tensor::new(seqlen_offset as i64, &q.device())?;
-
-            let (q, k) = candle_nn::apply_rotary_emb_qkv(
-                &q,
-                &k,
-                &self.rotary_emb.cos_sin,
-                &self.rotary_emb.sin,
-                &seqlen_offset,
-                rotary_dim,
-                false,
-                true,
-            )?;
-            Ok((q, k, v))
-        }
-        #[cfg(not(feature = "gcu"))]
-        {
-            self.rotary_emb.apply_rotary_emb_qkv(qkv, seqlen_offset)
-        }
     }
 
     fn forward(&mut self, xs: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
@@ -318,12 +292,15 @@ impl MHA {
             Some((prev_k, _)) => prev_k.dim(1)?,
         };
         // In the python implementation, a single tensor is returned with the third axis of size 3.
-        let (q, k, v) = self.rotary_emb_qkv(&qkv, seqlen_offset)?;
+        let (q, k, v) = {
+            let _enter = self.span_rope.enter();
+            self.rotary_emb.apply_rotary_emb_qkv(&qkv, seqlen_offset)?
+        };
         let (k, v) = match &self.kv_cache {
             None => (k, v),
             Some((prev_k, prev_v)) => {
-                let k = candle_nn::kvconcat(prev_k, &k, 1)?;
-                let v = candle_nn::kvconcat(prev_v, &v, 1)?;
+                let k = Tensor::cat(&[prev_k, &k], 1)?;
+                let v = Tensor::cat(&[prev_v, &v], 1)?;
                 (k, v)
             }
         };
@@ -338,9 +315,15 @@ impl MHA {
         // scores = scores + causal_mask.to(dtype=scores.dtype)
         let attn_weights = match mask {
             None => attn_weights,
-            Some(mask) => attn_weights.broadcast_add(mask)?,
+            Some(mask) => {
+                let _enter = self.span_mask.enter();
+                attn_weights.broadcast_add(mask)?
+            }
         };
-        let attn_weights = { candle_nn::ops::softmax_last_dim(&attn_weights)? };
+        let attn_weights = {
+            let _enter = self.span_softmax.enter();
+            candle_nn::ops::softmax_last_dim(&attn_weights)?
+        };
 
         // output = torch.einsum('bhts,bshd->bthd', attention_drop, v)
         // attn_weights: b*h,t,s, v: b*h,s,d
@@ -449,7 +432,7 @@ impl MixFormerSequentialForCausalLM {
         for block in self.blocks.iter_mut() {
             xs = block.forward(&xs, mask.as_ref())?
         }
-        xs.i((.., seq_len - 1, ..))?.apply(&self.head)?.squeeze(1)
+        xs.narrow(1, seq_len - 1, 1)?.apply(&self.head)?.squeeze(1)
     }
 
     pub fn forward_with_img(
@@ -469,7 +452,10 @@ impl MixFormerSequentialForCausalLM {
         for block in self.blocks.iter_mut() {
             xs = block.forward(&xs, mask.as_ref())?
         }
-        let xs = xs.i((.., seq_len - 1, ..))?.apply(&self.head)?.squeeze(1)?;
+        let xs = xs
+            .narrow(1, seq_len - 1, 1)?
+            .apply(&self.head)?
+            .squeeze(1)?;
         Ok(xs)
     }
 

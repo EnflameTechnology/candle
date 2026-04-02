@@ -57,7 +57,6 @@ pub mod cpu;
 pub mod cpu_backend;
 #[cfg(feature = "cuda")]
 pub mod cuda_backend;
-
 mod custom_op;
 mod device;
 pub mod display;
@@ -69,14 +68,13 @@ pub mod error;
 #[cfg(feature = "gcu")]
 pub mod gcu_backend;
 mod indexer;
+mod inference;
 pub mod layout;
 #[cfg(feature = "metal")]
 pub mod metal_backend;
 #[cfg(feature = "mkl")]
 mod mkl;
 pub mod npy;
-#[cfg(feature = "gcu")]
-pub mod offloadable;
 pub mod op;
 pub mod pickle;
 pub mod quantized;
@@ -96,12 +94,13 @@ mod variable;
 #[cfg(feature = "cudnn")]
 pub use cuda_backend::cudnn;
 
-pub use cpu_backend::CpuStorage;
+pub use cpu_backend::{CpuStorage, CpuStorageRef};
 pub use custom_op::{CustomOp1, CustomOp2, CustomOp3, InplaceOp1, InplaceOp2, InplaceOp3};
 pub use device::{Device, DeviceLocation, NdArray};
 pub use dtype::{DType, DTypeParseError, FloatDType, IntDType, WithDType};
 pub use error::{Context, Error, Result};
-pub use indexer::IndexOp;
+pub use indexer::{IndexOp, TensorIndexer};
+pub use inference::InferenceMode;
 pub use layout::Layout;
 pub use shape::{Shape, D};
 pub use storage::Storage;
@@ -112,6 +111,8 @@ pub use variable::Var;
 
 #[cfg(feature = "cuda")]
 pub use cuda_backend as cuda;
+#[cfg(any(feature = "cuda", feature = "gcu"))]
+pub mod offloadable;
 
 #[cfg(not(feature = "cuda"))]
 pub use dummy_cuda_backend as cuda;
@@ -152,7 +153,7 @@ impl ToUsize2 for (usize, usize) {
     }
 }
 
-// A simple trait defining a module with forward method using a single argument.
+/// Defining a module with forward method using a single argument.
 pub trait Module {
     fn forward(&self, xs: &Tensor) -> Result<Tensor>;
 }
@@ -172,8 +173,8 @@ impl<M: Module> Module for Option<&M> {
     }
 }
 
-// A trait defining a module with forward method using a single tensor argument and a flag to
-// separate the training and evaluation behaviors.
+/// A single forward method using a single single tensor argument and a flag to
+/// separate the training and evaluation behaviors.
 pub trait ModuleT {
     fn forward_t(&self, xs: &Tensor, train: bool) -> Result<Tensor>;
 }

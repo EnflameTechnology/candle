@@ -36,7 +36,7 @@ impl<B: Backend> Clone for VarBuilderArgs<'_, B> {
 pub type VarBuilder<'a> = VarBuilderArgs<'a, Box<dyn SimpleBackend + 'a>>;
 
 struct TensorData<B: Backend> {
-    backend: Arc<B>,
+    backend: B,
     pub device: Device,
 }
 
@@ -95,7 +95,7 @@ impl Backend for Box<dyn SimpleBackend + '_> {
 }
 
 impl<B: Backend> VarBuilderArgs<'_, B> {
-    pub fn new_with_args(backend: Arc<B>, dtype: DType, dev: &Device) -> Self {
+    pub fn new_with_args(backend: B, dtype: DType, dev: &Device) -> Self {
         let data = TensorData {
             backend,
             device: dev.clone(),
@@ -350,7 +350,7 @@ impl SimpleBackend for candle::npy::NpzTensors {
     }
 
     fn contains_tensor(&self, name: &str) -> bool {
-        self.get(name).map_or(false, |v| v.is_some())
+        self.get(name).is_ok_and(|v| v.is_some())
     }
 }
 
@@ -383,7 +383,7 @@ impl SimpleBackend for candle::pickle::PthTensors {
     }
 
     fn contains_tensor(&self, name: &str) -> bool {
-        self.get(name).map_or(false, |v| v.is_some())
+        self.get(name).is_ok_and(|v| v.is_some())
     }
 }
 
@@ -476,10 +476,7 @@ impl<'a> VarBuilder<'a> {
         dtype: DType,
         device: Device,
     ) -> Self {
-        let data = TensorData {
-            backend: Arc::new(backend),
-            device,
-        };
+        let data = TensorData { backend, device };
         Self {
             data: Arc::new(data),
             path: vec![],
@@ -593,10 +590,7 @@ impl<'a> VarBuilder<'a> {
         let path = self.path.clone();
         let backend = Rename::new(self, renamer);
         let backend: Box<dyn SimpleBackend + 'a> = Box::new(backend);
-        let data = TensorData {
-            backend: Arc::new(backend),
-            device,
-        };
+        let data = TensorData { backend, device };
         Self {
             data: Arc::new(data),
             dtype,
@@ -611,22 +605,6 @@ pub struct ShardedSafeTensors(candle::safetensors::MmapedSafetensors);
 pub type ShardedVarBuilder<'a> = VarBuilderArgs<'a, ShardedSafeTensors>;
 
 impl ShardedSafeTensors {
-    pub unsafe fn var_backend<P: AsRef<std::path::Path>>(
-        paths: &[P],
-    ) -> Result<Arc<ShardedSafeTensors>> {
-        let tensors = candle::safetensors::MmapedSafetensors::multi(paths)?;
-        let backend = ShardedSafeTensors(tensors);
-        Ok(Arc::new(backend))
-    }
-
-    pub unsafe fn from_backend(
-        backend: Arc<ShardedSafeTensors>,
-        dtype: DType,
-        dev: &Device,
-    ) -> Result<ShardedVarBuilder<'static>> {
-        Ok(VarBuilderArgs::new_with_args(backend, dtype, dev))
-    }
-
     /// Initializes a `VarBuilder` that retrieves tensors stored in a collection of safetensors
     /// files and make them usable in a sharded way.
     ///
@@ -640,7 +618,41 @@ impl ShardedSafeTensors {
     ) -> Result<ShardedVarBuilder<'static>> {
         let tensors = candle::safetensors::MmapedSafetensors::multi(paths)?;
         let backend = ShardedSafeTensors(tensors);
-        Ok(VarBuilderArgs::new_with_args(Arc::new(backend), dtype, dev))
+        Ok(VarBuilderArgs::new_with_args(backend, dtype, dev))
+    }
+
+    /// Share mmaped safetensors across processes / builders (GCU multi-process loading).
+    ///
+    /// # Safety
+    ///
+    /// The unsafe is inherited from [`memmap2::MmapOptions`].
+    pub unsafe fn var_backend<P: AsRef<std::path::Path>>(
+        paths: &[P],
+    ) -> Result<Arc<ShardedSafeTensors>> {
+        let tensors = candle::safetensors::MmapedSafetensors::multi(paths)?;
+        Ok(Arc::new(ShardedSafeTensors(tensors)))
+    }
+
+    /// Build a [`ShardedVarBuilder`] from a shared backend created with [`ShardedSafeTensors::var_backend`].
+    ///
+    /// `backend` must be the only [`Arc`] reference (see [`Arc::try_unwrap`]); otherwise use
+    /// [`ShardedSafeTensors::var_builder`] instead.
+    ///
+    /// # Safety
+    ///
+    /// The unsafe is inherited from mmap setup of the underlying tensors.
+    pub unsafe fn from_backend(
+        backend: Arc<ShardedSafeTensors>,
+        dtype: DType,
+        dev: &Device,
+    ) -> Result<ShardedVarBuilder<'static>> {
+        let backend = Arc::try_unwrap(backend).map_err(|_| {
+            Error::Msg(
+                "ShardedSafeTensors::from_backend: Arc must have a single strong reference"
+                    .to_string(),
+            )
+        })?;
+        Ok(VarBuilderArgs::new_with_args(backend, dtype, dev))
     }
 }
 
@@ -725,8 +737,14 @@ impl Backend for ShardedSafeTensors {
                     "Cannot slice tensor {path} ({shape:?} along dim {dim} with {start}..{stop}"
                 ))
             })?
+        } else if dim == 2 {
+            view.slice((.., .., start..stop)).map_err(|_| {
+                Error::Msg(format!(
+                    "Cannot slice tensor {path} ({shape:?} along dim {dim} with {start}..{stop}"
+                ))
+            })?
         } else {
-            candle::bail!("Get sharded on dimensions != 0 or 1")
+            candle::bail!("Get sharded on dimensions != 0, 1 or 2")
         };
 
         shape[dim] = block_size;

@@ -62,10 +62,10 @@ impl From<f64> for LayerNormConfig {
 // This layer norm version handles both weight and bias so removes the mean.
 #[derive(Clone, Debug)]
 pub struct LayerNorm {
-    pub weight: Tensor,
-    pub bias: Option<Tensor>,
-    pub remove_mean: bool,
-    pub eps: f64,
+    weight: Tensor,
+    bias: Option<Tensor>,
+    remove_mean: bool,
+    eps: f64,
 }
 
 impl LayerNorm {
@@ -105,7 +105,6 @@ impl LayerNorm {
     }
 }
 
-#[cfg(not(feature = "gcu"))]
 impl Module for LayerNorm {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         if x.is_contiguous() && self.remove_mean {
@@ -136,50 +135,6 @@ impl Module for LayerNorm {
     }
 }
 
-#[cfg(feature = "gcu")]
-impl Module for LayerNorm {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        if x.device().is_gcu() {
-            use candle::gcu_backend::LayerNorm;
-            let op = LayerNorm {
-                eps: self.eps as f32,
-                remove_mean: self.remove_mean,
-                affine: self.bias.is_some(),
-            };
-            let x = if x.is_contiguous() {
-                x
-            } else {
-                &x.contiguous()?
-            };
-            match &self.bias {
-                Some(bias) => x.apply_op3(&self.weight, bias, op),
-                None => x.apply_op3(&self.weight, &self.weight, op),
-            }
-        } else {
-            let x_dtype = x.dtype();
-            let internal_dtype = match x_dtype {
-                DType::F16 | DType::BF16 => DType::F32,
-                d => d,
-            };
-            let hidden_size = x.dim(D::Minus1)?;
-            let x = x.to_dtype(internal_dtype)?;
-            let x = if self.remove_mean {
-                let mean_x = (x.sum_keepdim(D::Minus1)? / hidden_size as f64)?;
-                x.broadcast_sub(&mean_x)?
-            } else {
-                x
-            };
-            let norm_x = (x.sqr()?.sum_keepdim(D::Minus1)? / hidden_size as f64)?;
-            let x_normed = x.broadcast_div(&(norm_x + self.eps)?.sqrt()?)?;
-            let x = x_normed.to_dtype(x_dtype)?.broadcast_mul(&self.weight)?;
-            match &self.bias {
-                None => Ok(x),
-                Some(bias) => x.broadcast_add(bias),
-            }
-        }
-    }
-}
-
 pub fn layer_norm<C: Into<LayerNormConfig>>(
     size: usize,
     config: C,
@@ -198,6 +153,15 @@ pub fn layer_norm<C: Into<LayerNormConfig>>(
         remove_mean: config.remove_mean,
         eps: config.eps,
     })
+}
+
+pub fn layer_norm_no_bias(size: usize, eps: f64, vb: crate::VarBuilder) -> Result<LayerNorm> {
+    let config = LayerNormConfig {
+        eps,
+        remove_mean: true,
+        affine: false,
+    };
+    layer_norm(size, config, vb)
 }
 
 /// RmsNorm is a specialized version of the LayerNorm module.
@@ -221,7 +185,7 @@ impl RmsNorm {
 
 impl Module for RmsNorm {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        if !xs.device().is_gcu() && xs.is_contiguous() {
+        if xs.is_contiguous() {
             crate::ops::rms_norm(xs, &self.0.weight, self.0.eps as f32)
         } else {
             self.0.forward(xs)
