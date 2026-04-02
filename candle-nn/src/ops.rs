@@ -1256,9 +1256,6 @@ pub fn elu(xs: &Tensor, alpha: f64) -> Result<Tensor> {
 #[derive(Clone, Debug)]
 pub struct Identity;
 
-#[derive(Clone, Debug)]
-pub struct Identity;
-
 impl Identity {
     pub fn new() -> Identity {
         Self

@@ -344,7 +344,7 @@ impl BackendDevice for GcuDevice {
         self.id == rhs.id
     }
 
-    fn zeros_impl(&self, shape: &Shape, dtype: DType) -> Result<GcuStorage> {
+    fn zeros_impl(&self, shape: &Shape, dtype: DType, _sync_alloc: bool) -> Result<GcuStorage> {
         let elem_count = shape.elem_count();
         let slice = match dtype {
             DType::U8 => {

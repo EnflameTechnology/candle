@@ -154,6 +154,14 @@ impl OffloadBuffer {
                         self.ptr_host as *mut u32,
                         self.len,
                     )?),
+                    DType::I8 => crate::Storage::Gcu(dev.storage_from_buffer(
+                        self.ptr_host as *mut i8,
+                        self.len,
+                    )?),
+                    DType::I32 => crate::Storage::Gcu(dev.storage_from_buffer(
+                        self.ptr_host as *mut i32,
+                        self.len,
+                    )?),
                     DType::I64 => crate::Storage::Gcu(dev.storage_from_buffer(
                         self.ptr_host as *mut i64,
                         self.len,

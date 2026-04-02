@@ -162,6 +162,28 @@ impl VecOps for i64 {
         <Self as Ord>::max(self, other)
     }
 }
+impl VecOps for i8 {
+    #[inline(always)]
+    fn min(self, other: Self) -> Self {
+        <Self as Ord>::min(self, other)
+    }
+
+    #[inline(always)]
+    fn max(self, other: Self) -> Self {
+        <Self as Ord>::max(self, other)
+    }
+}
+impl VecOps for i32 {
+    #[inline(always)]
+    fn min(self, other: Self) -> Self {
+        <Self as Ord>::min(self, other)
+    }
+
+    #[inline(always)]
+    fn max(self, other: Self) -> Self {
+        <Self as Ord>::max(self, other)
+    }
+}
 
 #[inline(always)]
 pub fn par_for_each(n_threads: usize, func: impl Fn(usize) + Send + Sync) {

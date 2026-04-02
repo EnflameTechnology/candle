@@ -200,8 +200,20 @@ impl Tensor {
                     storage.device(),
                     self.device(),
                 )?),
+                DType::I8 => Arc::new(OffloadBuffer::new(
+                    storage.as_slice::<i8>()?,
+                    self.dtype(),
+                    storage.device(),
+                    self.device(),
+                )?),
                 DType::U32 => Arc::new(OffloadBuffer::new(
                     storage.as_slice::<u32>()?,
+                    self.dtype(),
+                    storage.device(),
+                    self.device(),
+                )?),
+                DType::I32 => Arc::new(OffloadBuffer::new(
+                    storage.as_slice::<i32>()?,
                     self.dtype(),
                     storage.device(),
                     self.device(),
@@ -2462,7 +2474,7 @@ impl Tensor {
             let tensor_ = Tensor_ {
                 id: TensorId::new(),
                 storage: self.storage.clone(),
-                layout: Layout::contiguous_with_offset(shape, self.layout.start_offset()),
+                layout: Layout::contiguous_with_offset(shape, &self.layout),
                 op,
                 is_variable: false,
                 dtype: self.dtype,

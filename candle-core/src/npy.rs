@@ -232,8 +232,10 @@ impl Tensor {
                 Tensor::from_vec(data_t, shape, &Device::Cpu)
             }
             DType::I8 => {
-                let mut data_t = vec![0u8; elem_count];
-                reader.read_exact(&mut data_t)?;
+                let mut data_t = vec![0i8; elem_count];
+                reader.read_exact(unsafe {
+                    std::slice::from_raw_parts_mut(data_t.as_mut_ptr() as *mut u8, elem_count)
+                })?;
                 Tensor::from_vec(data_t, shape, &Device::Cpu)
             }
             DType::U32 => {

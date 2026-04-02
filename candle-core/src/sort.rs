@@ -1,3 +1,4 @@
+use crate::backend::BackendStorage;
 use crate::{Result, Tensor};
 use rayon::prelude::*;
 
@@ -109,7 +110,9 @@ impl crate::CustomOp1 for ArgSort {
     ) -> Result<(crate::CpuStorage, crate::Shape)> {
         let sort_indexes = match storage {
             crate::CpuStorage::U8(vs) => self.asort(vs, layout),
+            crate::CpuStorage::I8(vs) => self.asort(vs, layout),
             crate::CpuStorage::U32(vs) => self.asort(vs, layout),
+            crate::CpuStorage::I32(vs) => self.asort(vs, layout),
             crate::CpuStorage::I64(vs) => self.asort(vs, layout),
             crate::CpuStorage::BF16(vs) => self.asort(vs, layout),
             crate::CpuStorage::F16(vs) => self.asort(vs, layout),
@@ -154,7 +157,9 @@ impl crate::CustomOp1 for ArgSort {
                     DType::F32 => "asort_asc_f32",
                     DType::F64 => "asort_asc_f64",
                     DType::U8 => "asort_asc_u8",
+                    DType::I8 => "asort_asc_i8",
                     DType::U32 => "asort_asc_u32",
+                    DType::I32 => "asort_asc_i32",
                     DType::I64 => "asort_asc_i64",
                 }
             } else {
@@ -164,7 +169,9 @@ impl crate::CustomOp1 for ArgSort {
                     DType::F32 => "asort_desc_f32",
                     DType::F64 => "asort_desc_f64",
                     DType::U8 => "asort_desc_u8",
+                    DType::I8 => "asort_desc_i8",
                     DType::U32 => "asort_desc_u32",
+                    DType::I32 => "asort_desc_i32",
                     DType::I64 => "asort_desc_i64",
                 }
             }
@@ -215,13 +222,14 @@ impl crate::CustomOp1 for ArgSort {
 
         let (src_ptr, dtype_str) = match &storage.slice {
             GcuStorageSlice::U8(inp) => (inp.device_ptr(), "u8"),
+            GcuStorageSlice::I8(inp) => (inp.device_ptr(), "i8"),
             GcuStorageSlice::U32(inp) => (inp.device_ptr(), "u32"),
+            GcuStorageSlice::I32(inp) => (inp.device_ptr(), "i32"),
             GcuStorageSlice::I64(inp) => (inp.device_ptr(), "i64"),
             GcuStorageSlice::BF16(inp) => (inp.device_ptr(), "bf16"),
             GcuStorageSlice::F16(inp) => (inp.device_ptr(), "f16"),
             GcuStorageSlice::F32(inp) => (inp.device_ptr(), "f32"),
             GcuStorageSlice::F64(inp) => (inp.device_ptr(), "f64"),
-            _ => panic!("not supported!"),
         };
         let dst_ptr = dst.device_ptr();
 

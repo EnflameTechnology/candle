@@ -356,7 +356,7 @@ impl Device {
                 Ok(Storage::Cuda(storage))
             }
             Device::Gcu(device) => {
-                let storage = device.zeros_impl(shape, dtype)?;
+                let storage = device.zeros_impl(shape, dtype, sync_alloc)?;
                 Ok(Storage::Gcu(storage))
             }
             Device::Metal(device) => {

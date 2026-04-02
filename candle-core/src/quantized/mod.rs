@@ -52,6 +52,9 @@ impl Device {
                 let storage = cuda::QCudaStorage::zeros(cuda, elem_count, dtype)?;
                 Ok(QStorage::Cuda(storage))
             }
+            Device::Gcu(_) => {
+                crate::bail!("quantized tensors are not supported on GCU")
+            }
         }
     }
 }
