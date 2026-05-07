@@ -7,12 +7,6 @@
 
 use super::with_tracing::{linear_no_bias as linear, Linear, RmsNorm};
 use candle::{DType, Device, IndexOp, Result, Tensor, D};
-<<<<<<< HEAD:candle-examples/examples/gcutest/model.rs
-use candle_nn::{apply_rotary_emb_qkv, kvconcat, Embedding, Module, VarBuilder};
-use serde::Deserialize;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-=======
 use candle_nn::{embedding, Embedding, Module, VarBuilder};
 use std::{collections::HashMap, f32::consts::PI};
 
@@ -26,7 +20,6 @@ pub enum GraniteRopeType {
     #[serde(rename = "default")]
     Default,
 }
->>>>>>> guoqing/candle-main:candle-transformers/src/models/granite.rs
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
 pub struct GraniteRopeConfig {
@@ -107,63 +100,13 @@ pub struct Config {
     pub max_position_embeddings: usize,
 }
 
-<<<<<<< HEAD:candle-examples/examples/gcutest/model.rs
-impl Config {
-    pub fn config_7b_v1(use_flash_attn: bool) -> Self {
-        Self {
-            hidden_size: 4096,
-            intermediate_size: 11008,
-            vocab_size: 32000,
-            num_hidden_layers: 32,
-            num_attention_heads: 32,
-            num_key_value_heads: 32,
-            use_flash_attn,
-            rms_norm_eps: 1e-6,
-            rope_theta: 10_000.0,
-        }
-    }
-
-    pub fn config_7b_v2(use_flash_attn: bool) -> Self {
-        Self {
-            hidden_size: 4096,
-            intermediate_size: 11008,
-            vocab_size: 32000,
-            num_hidden_layers: 32,
-            num_attention_heads: 32,
-            num_key_value_heads: 32,
-            use_flash_attn,
-            rms_norm_eps: 1e-5,
-            rope_theta: 10_000.0,
-        }
-    }
-}
-
-// We wrap the `Linear` layer here to add some tracing so that it's easier to profile the resulting
-// model.
-#[derive(Debug)]
-pub struct Linear {
-    inner: candle_nn::Linear,
-    span: tracing::Span,
-}
-
-impl Linear {
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let _enter = self.span.enter();
-        self.inner.forward(x)
-    }
-}
-
-#[derive(Clone)]
-=======
 #[derive(Debug, Clone)]
->>>>>>> guoqing/candle-main:candle-transformers/src/models/granite.rs
 pub struct Cache {
     masks: HashMap<usize, Tensor>,
     pub use_kv_cache: bool,
     kvs: Vec<Option<(Tensor, Tensor)>>,
     cos: Tensor,
     sin: Tensor,
-    cos_sin: Tensor,
     device: Device,
 }
 
@@ -216,14 +159,6 @@ impl Cache {
             .to_dtype(DType::F32)?
             .reshape((config.max_position_embeddings, 1))?
             .matmul(&theta.reshape((1, theta.elem_count()))?)?;
-<<<<<<< HEAD:candle-examples/examples/gcutest/model.rs
-        // This is different from the paper, see:
-        // https://github.com/huggingface/transformers/blob/6112b1c6442aaf7affd2b0676a1cd4eee30c45cf/src/transformers/models/llama/modeling_llama.py#L112
-        let cos_sin =
-            Tensor::cat(&[&idx_theta.cos()?, &idx_theta.sin()?], D::Minus1)?.contiguous()?; //must be contiguous float32 tensor;
-        let idx_theta = Tensor::cat(&[&idx_theta, &idx_theta], D::Minus1)?;
-=======
->>>>>>> guoqing/candle-main:candle-transformers/src/models/granite.rs
         let cos = idx_theta.cos()?.to_dtype(dtype)?;
         let sin = idx_theta.sin()?.to_dtype(dtype)?;
         Ok(Self {
@@ -233,18 +168,11 @@ impl Cache {
             device: device.clone(),
             cos,
             sin,
-            cos_sin,
         })
     }
 
-<<<<<<< HEAD:candle-examples/examples/gcutest/model.rs
-    pub fn mask(&self, t: usize) -> Result<Tensor> {
-        let mut masks = self.masks.lock().unwrap();
-        if let Some(mask) = masks.get(&t) {
-=======
     fn mask(&mut self, t: usize) -> Result<Tensor> {
         if let Some(mask) = self.masks.get(&t) {
->>>>>>> guoqing/candle-main:candle-transformers/src/models/granite.rs
             Ok(mask.clone())
         } else {
             let mask: Vec<_> = (0..t)
@@ -257,41 +185,8 @@ impl Cache {
     }
 }
 
-<<<<<<< HEAD:candle-examples/examples/gcutest/model.rs
-pub fn linear(size1: usize, size2: usize, vb: VarBuilder) -> Result<Linear> {
-    let span = tracing::span!(tracing::Level::TRACE, "linear");
-    let inner = candle_nn::linear_no_bias(size1, size2, vb)?;
-    Ok(Linear { inner, span })
-}
-
-pub fn embedding(cfg: &Config, vb: VarBuilder) -> Result<Embedding> {
-    let embeddings = vb.get((cfg.vocab_size, cfg.hidden_size), "weight")?;
-    Ok(Embedding::new(embeddings, cfg.hidden_size))
-}
-
-pub struct RmsNorm {
-    inner: candle_nn::RmsNorm,
-    span: tracing::Span,
-}
-
-impl RmsNorm {
-    pub fn load(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
-        let span = tracing::span!(tracing::Level::TRACE, "rms-norm");
-        let inner = candle_nn::rms_norm(size, eps, vb)?;
-        Ok(Self { inner, span })
-    }
-
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let _enter = self.span.enter();
-        self.inner.forward(x)
-    }
-}
-
-pub struct CausalSelfAttention {
-=======
 #[derive(Debug, Clone)]
 struct CausalSelfAttention {
->>>>>>> guoqing/candle-main:candle-transformers/src/models/granite.rs
     q_proj: Linear,
     k_proj: Linear,
     v_proj: Linear,
@@ -322,11 +217,7 @@ fn flash_attn(_: &Tensor, _: &Tensor, _: &Tensor, _: f32, _: bool) -> Result<Ten
 }
 
 impl CausalSelfAttention {
-<<<<<<< HEAD:candle-examples/examples/gcutest/model.rs
-    pub fn apply_rotary_emb(&self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
-=======
     fn apply_rotary_emb(&self, x: &Tensor, index_pos: usize, cache: &Cache) -> Result<Tensor> {
->>>>>>> guoqing/candle-main:candle-transformers/src/models/granite.rs
         let _enter = self.span_rot.enter();
         let (_b_sz, _, seq_len, _hidden_size) = x.dims4()?;
         let cos = cache.cos.narrow(0, index_pos, seq_len)?;
@@ -334,9 +225,6 @@ impl CausalSelfAttention {
         candle_nn::rotary_emb::rope(x, &cos, &sin)
     }
 
-<<<<<<< HEAD:candle-examples/examples/gcutest/model.rs
-    pub fn forward(&self, x: &Tensor, index_pos: usize, block_idx: usize) -> Result<Tensor> {
-=======
     fn forward(
         &self,
         x: &Tensor,
@@ -344,7 +232,6 @@ impl CausalSelfAttention {
         block_idx: usize,
         cache: &mut Cache,
     ) -> Result<Tensor> {
->>>>>>> guoqing/candle-main:candle-transformers/src/models/granite.rs
         let _enter = self.span.enter();
         let (b_sz, seq_len, hidden_size) = x.dims3()?;
         let q = self.q_proj.forward(x)?;
@@ -363,35 +250,6 @@ impl CausalSelfAttention {
             .reshape((b_sz, seq_len, self.num_key_value_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-<<<<<<< HEAD:candle-examples/examples/gcutest/model.rs
-        let (q, mut k) = apply_rotary_emb_qkv(
-            &q,
-            &k,
-            if q.device().is_gcu() {
-                &self.cache.cos_sin
-            } else {
-                &self.cache.cos
-            },
-            &self.cache.sin,
-            index_pos,
-            0,
-            true,
-            true,
-        )?;
-
-        if self.cache.use_kv_cache {
-            let mut cache = self.cache.kvs.lock().unwrap();
-            if let Some((cache_k, cache_v)) = &cache[block_idx] {
-                if k.device().is_gcu() {
-                    //inputs for kvconcat must be contiguous tensors
-                    k = kvconcat(cache_k, &k, 2)?;
-                    v = kvconcat(cache_v, &v, 2)?;
-                } else {
-                    k = Tensor::cat(&[cache_k, &k], 2)?.contiguous()?;
-                    v = Tensor::cat(&[cache_v, &v], 2)?.contiguous()?;
-                }
-
-=======
         let q = self.apply_rotary_emb(&q, index_pos, cache)?;
         let mut k = self.apply_rotary_emb(&k, index_pos, cache)?;
 
@@ -399,7 +257,6 @@ impl CausalSelfAttention {
             if let Some((cache_k, cache_v)) = &cache.kvs[block_idx] {
                 k = Tensor::cat(&[cache_k, &k], 2)?.contiguous()?;
                 v = Tensor::cat(&[cache_v, &v], 2)?.contiguous()?;
->>>>>>> guoqing/candle-main:candle-transformers/src/models/granite.rs
                 let k_seq_len = k.dims()[1];
                 if k_seq_len > self.max_position_embeddings {
                     k = k
@@ -459,11 +316,7 @@ impl CausalSelfAttention {
         crate::utils::repeat_kv(x, self.num_attention_heads / self.num_key_value_heads)
     }
 
-<<<<<<< HEAD:candle-examples/examples/gcutest/model.rs
-    pub fn load(vb: VarBuilder, cache: &Cache, cfg: &Config) -> Result<Self> {
-=======
     fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
->>>>>>> guoqing/candle-main:candle-transformers/src/models/granite.rs
         let span = tracing::span!(tracing::Level::TRACE, "attn");
         let span_rot = tracing::span!(tracing::Level::TRACE, "attn-rot");
         let size_in = cfg.hidden_size;
@@ -489,19 +342,15 @@ impl CausalSelfAttention {
     }
 }
 
-pub fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: f32) -> Result<Tensor> {
+fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: f32) -> Result<Tensor> {
     let shape = mask.shape();
     let on_true = Tensor::new(on_true, on_false.device())?.broadcast_as(shape.dims())?;
     let m = mask.where_cond(&on_true, on_false)?;
     Ok(m)
 }
 
-<<<<<<< HEAD:candle-examples/examples/gcutest/model.rs
-pub struct Mlp {
-=======
 #[derive(Debug, Clone)]
 struct Mlp {
->>>>>>> guoqing/candle-main:candle-transformers/src/models/granite.rs
     c_fc1: Linear,
     c_fc2: Linear,
     c_proj: Linear,
@@ -509,13 +358,13 @@ struct Mlp {
 }
 
 impl Mlp {
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
         let x = (candle_nn::ops::silu(&self.c_fc1.forward(x)?)? * self.c_fc2.forward(x)?)?;
         self.c_proj.forward(&x)
     }
 
-    pub fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
+    fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "mlp");
         let h_size = cfg.hidden_size;
         let i_size = cfg.intermediate_size;
@@ -531,12 +380,8 @@ impl Mlp {
     }
 }
 
-<<<<<<< HEAD:candle-examples/examples/gcutest/model.rs
-pub struct Block {
-=======
 #[derive(Debug, Clone)]
 struct Block {
->>>>>>> guoqing/candle-main:candle-transformers/src/models/granite.rs
     rms_1: RmsNorm,
     attn: CausalSelfAttention,
     rms_2: RmsNorm,
@@ -545,9 +390,6 @@ struct Block {
 }
 
 impl Block {
-<<<<<<< HEAD:candle-examples/examples/gcutest/model.rs
-    pub fn forward(&self, x: &Tensor, index_pos: usize, block_idx: usize) -> Result<Tensor> {
-=======
     fn forward(
         &self,
         x: &Tensor,
@@ -555,7 +397,6 @@ impl Block {
         block_idx: usize,
         cache: &mut Cache,
     ) -> Result<Tensor> {
->>>>>>> guoqing/candle-main:candle-transformers/src/models/granite.rs
         let _enter = self.span.enter();
         let residual = x;
         let x = self.rms_1.forward(x)?;
@@ -565,11 +406,7 @@ impl Block {
         Ok(x)
     }
 
-<<<<<<< HEAD:candle-examples/examples/gcutest/model.rs
-    pub fn load(vb: VarBuilder, cache: &Cache, cfg: &Config) -> Result<Self> {
-=======
     fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
->>>>>>> guoqing/candle-main:candle-transformers/src/models/granite.rs
         let span = tracing::span!(tracing::Level::TRACE, "block");
         let attn = CausalSelfAttention::load(vb.pp("self_attn"), cfg)?;
         let mlp = Mlp::load(vb.pp("mlp"), cfg)?;

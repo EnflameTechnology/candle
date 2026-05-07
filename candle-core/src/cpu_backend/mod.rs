@@ -2167,9 +2167,7 @@ impl BackendStorage for CpuStorage {
     ) -> Result<()> {
         match (self, dst) {
             (Self::U8(src), Self::U8(dst)) => copy2d_(src, dst, d1, d2, src_s, dst_s, src_o, dst_o),
-            (Self::I8(src), Self::I8(dst)) => {
-                copy2d_(src, dst, d1, d2, src_s, dst_s, src_o, dst_o)
-            }
+            (Self::I8(src), Self::I8(dst)) => copy2d_(src, dst, d1, d2, src_s, dst_s, src_o, dst_o),
             (Self::U32(src), Self::U32(dst)) => {
                 copy2d_(src, dst, d1, d2, src_s, dst_s, src_o, dst_o)
             }
@@ -2555,11 +2553,7 @@ impl BackendDevice for CpuDevice {
         let elem_count = shape.elem_count();
         let mut rng = rand::rng();
         match dtype {
-            DType::U8
-            | DType::I8
-            | DType::U32
-            | DType::I32
-            | DType::I64 => {
+            DType::U8 | DType::I8 | DType::U32 | DType::I32 | DType::I64 => {
                 Err(Error::UnsupportedDTypeForOp(dtype, "rand_uniform").bt())
             }
             DType::BF16 => {
@@ -2606,11 +2600,7 @@ impl BackendDevice for CpuDevice {
         let elem_count = shape.elem_count();
         let mut rng = rand::rng();
         match dtype {
-            DType::U8
-            | DType::I8
-            | DType::U32
-            | DType::I32
-            | DType::I64 => {
+            DType::U8 | DType::I8 | DType::U32 | DType::I32 | DType::I64 => {
                 Err(Error::UnsupportedDTypeForOp(dtype, "rand_normal").bt())
             }
             DType::BF16 => {

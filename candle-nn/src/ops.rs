@@ -236,9 +236,19 @@ impl candle::CustomOp1 for Sigmoid {
     }
 }
 
-#[cfg(not(feature = "gcu"))]
 pub fn sigmoid(xs: &Tensor) -> Result<Tensor> {
-    xs.apply_op1(Sigmoid)
+    #[cfg(not(feature = "gcu"))]
+    {
+        xs.apply_op1(Sigmoid)
+    }
+    #[cfg(feature = "gcu")]
+    {
+        let one = Tensor::ones(xs.shape(), xs.dtype(), xs.device())?;
+        let neg_xs = xs.neg()?;
+        let exp_neg = neg_xs.exp()?;
+        let denom = (&one + &exp_neg)?;
+        one.broadcast_div(&denom)
+    }
 }
 
 pub fn hard_sigmoid(xs: &Tensor) -> Result<Tensor> {
@@ -647,6 +657,70 @@ impl candle::CustomOp2 for RmsNorm {
         Ok((dst, l1.shape().clone()))
     }
 
+    #[cfg(feature = "gcu")]
+    fn gcu_fwd(
+        &self,
+        s1: &GcuStorage,
+        l1: &Layout,
+        s2: &GcuStorage,
+        _l2: &Layout,
+    ) -> Result<(GcuStorage, Shape)> {
+        use candle::gcu_backend::ubridge;
+        use candle::gcu_backend::ubridge::device_ptr::DevicePtr;
+        use candle::gcu_backend::ubridge::gcu_launch::GcuLaunchAsync;
+        use candle::gcu_backend::ubridge::prelude::DeviceSlice;
+        use candle::gcu_backend::{GcuStorageSlice, WrapErr};
+        use half::{bf16, f16};
+
+        let dev = &s1.device;
+        let cfg = &dev.launch_cfg;
+        let elem_count = l1.shape().elem_count();
+        let dims = l1.shape().dims();
+        let dim_m1 = dims[dims.len() - 1];
+        let (batch, chunks, last_dim_size) = if dims.len() == 1 {
+            (1, 1, dim_m1)
+        } else {
+            (dims[0], elem_count / dims[0] / dim_m1, dim_m1)
+        };
+
+        macro_rules! rmsnorm_gcu {
+            ($x:expr, $w:expr, $ty:ty, $variant:ident, $kname:expr) => {{
+                let out = dev.alloc::<$ty>(elem_count).w()?;
+                let func = dev.get_or_load_func($kname, ubridge::REDUCE)?;
+                let params = (
+                    $x.device_ptr(),
+                    out.device_ptr(),
+                    $w.device_ptr(),
+                    $w.device_ptr(),
+                    batch as i32,
+                    chunks as i32,
+                    last_dim_size as i32,
+                    self.eps,
+                    0i32,
+                    0i32,
+                );
+                unsafe { func.launch(cfg, params) }.w()?;
+                GcuStorageSlice::$variant(out)
+            }};
+        }
+
+        let slice = match (&s1.slice, &s2.slice) {
+            (GcuStorageSlice::BF16(x), GcuStorageSlice::BF16(w)) => {
+                rmsnorm_gcu!(x, w, bf16, BF16, "layernorm_bf16")
+            }
+            (GcuStorageSlice::F16(x), GcuStorageSlice::F16(w)) => {
+                rmsnorm_gcu!(x, w, f16, F16, "layernorm_f16")
+            }
+            (GcuStorageSlice::F32(x), GcuStorageSlice::F32(w)) => {
+                rmsnorm_gcu!(x, w, f32, F32, "layernorm_f32")
+            }
+            _ => candle::bail!("unsupported dtype for rmsnorm on gcu"),
+        };
+
+        let device = dev.clone();
+        Ok((candle::GcuStorage { slice, device }, l1.shape().clone()))
+    }
+
     #[cfg(feature = "metal")]
     fn metal_fwd(
         &self,
@@ -939,6 +1013,72 @@ impl candle::CustomOp3 for LayerNorm {
         let newstorage = candle::MetalStorage::new(output, device.clone(), elem_count, s1.dtype());
         Ok((newstorage, l1.shape().clone()))
     }
+
+    #[cfg(feature = "gcu")]
+    fn gcu_fwd(
+        &self,
+        s1: &GcuStorage,
+        l1: &Layout,
+        s2: &GcuStorage,
+        _l2: &Layout,
+        s3: &GcuStorage,
+        _l3: &Layout,
+    ) -> Result<(GcuStorage, Shape)> {
+        use candle::gcu_backend::ubridge;
+        use candle::gcu_backend::ubridge::device_ptr::DevicePtr;
+        use candle::gcu_backend::ubridge::gcu_launch::GcuLaunchAsync;
+        use candle::gcu_backend::ubridge::prelude::DeviceSlice;
+        use candle::gcu_backend::{GcuStorageSlice, WrapErr};
+        use half::{bf16, f16};
+
+        let dev = &s1.device;
+        let cfg = &dev.launch_cfg;
+        let elem_count = l1.shape().elem_count();
+        let dims = l1.shape().dims();
+        let dim_m1 = dims[dims.len() - 1];
+        let (batch, chunks, last_dim_size) = if dims.len() == 1 {
+            (1, 1, dim_m1)
+        } else {
+            (dims[0], elem_count / dims[0] / dim_m1, dim_m1)
+        };
+
+        macro_rules! layernorm_gcu {
+            ($x:expr, $w:expr, $b:expr, $ty:ty, $variant:ident, $kname:expr) => {{
+                let out = dev.alloc::<$ty>(elem_count).w()?;
+                let func = dev.get_or_load_func($kname, ubridge::REDUCE)?;
+                let params = (
+                    $x.device_ptr(),
+                    out.device_ptr(),
+                    $w.device_ptr(),
+                    $b.device_ptr(),
+                    batch as i32,
+                    chunks as i32,
+                    last_dim_size as i32,
+                    self.eps,
+                    1i32,
+                    1i32,
+                );
+                unsafe { func.launch(cfg, params) }.w()?;
+                GcuStorageSlice::$variant(out)
+            }};
+        }
+
+        let slice = match (&s1.slice, &s2.slice, &s3.slice) {
+            (GcuStorageSlice::BF16(x), GcuStorageSlice::BF16(w), GcuStorageSlice::BF16(b)) => {
+                layernorm_gcu!(x, w, b, bf16, BF16, "layernorm_bf16")
+            }
+            (GcuStorageSlice::F16(x), GcuStorageSlice::F16(w), GcuStorageSlice::F16(b)) => {
+                layernorm_gcu!(x, w, b, f16, F16, "layernorm_f16")
+            }
+            (GcuStorageSlice::F32(x), GcuStorageSlice::F32(w), GcuStorageSlice::F32(b)) => {
+                layernorm_gcu!(x, w, b, f32, F32, "layernorm_f32")
+            }
+            _ => candle::bail!("unsupported dtype for layernorm on gcu"),
+        };
+
+        let device = dev.clone();
+        Ok((candle::GcuStorage { slice, device }, l1.shape().clone()))
+    }
 }
 
 pub fn layer_norm_slow(x: &Tensor, alpha: &Tensor, beta: &Tensor, eps: f32) -> Result<Tensor> {
@@ -1015,244 +1155,6 @@ pub fn replication_pad2d(xs: &Tensor, pad: usize) -> Result<Tensor> {
     }
 }
 
-//gcu apply_rotary_emb_qkv supports both rope and partial rope
-#[cfg(feature = "gcu")]
-pub fn apply_rotary_emb_qkv(
-    query: &Tensor,
-    key: &Tensor,
-    cos_sin: &Tensor,
-    _: &Tensor,
-    index_positions: &Tensor,
-    split_dim: usize,
-    query_key_transposed: bool,
-    gpt_neox: bool,
-) -> Result<(Tensor, Tensor)> {
-    pub fn fused_rope(
-        query: &Tensor,
-        key: &Tensor,
-        cos_sin: &Tensor,
-        cos_sin_length: i32,
-        cos_sin_stride: i32,
-        index_positions: &Tensor,
-        num_tokens: i32,
-        q_head_size: i32,
-        k_head_size: i32,
-        hidden_size: i32,
-        split_dim: i32, //used for partial rope
-        gpt_neox: i32,
-    ) -> Result<Tensor> {
-        use candle::gcu_backend::Rope;
-        let op = Rope {
-            cos_sin_length,
-            cos_sin_stride,
-            index_positions: index_positions.clone(),
-            num_tokens,
-            q_head_size,
-            k_head_size,
-            hidden_size,
-            split_dim,
-            gpt_neox,
-        };
-        query.apply_op3(key, cos_sin, op)
-    }
-    let cos_sin_dims = cos_sin.shape().dims();
-    let cos_sin_length = cos_sin_dims[0];
-    let cos_sin_stride = cos_sin_dims[cos_sin_dims.len() - 1];
-    if query_key_transposed {
-        //(b_sz, num_heads, seq_len, hidden_size)
-        let (b_sz, q_head_size, seq_len, hidden_size) = query.dims4()?;
-        let (_, k_head_size, _, _) = key.dims4()?;
-        let _ = fused_rope(
-            query,
-            key,
-            cos_sin,
-            cos_sin_length as i32,
-            cos_sin_stride as i32,
-            index_positions,
-            (b_sz * seq_len) as i32,
-            q_head_size as i32,
-            k_head_size as i32,
-            hidden_size as i32,
-            split_dim as i32,
-            if gpt_neox { 1 } else { 0 },
-        )?;
-        Ok((query.contiguous()?, key.contiguous()?))
-    } else {
-        //NOTE: gpt_neox not for ChatGLM, seq_len in dim1 not for ChatGLM
-        //(b_sz, seq_len, num_heads, hidden_size)
-        let (b_sz, seq_len, q_head_size, hidden_size) = query.dims4()?;
-        let (_, _, k_head_size, _) = key.dims4()?;
-        let _ = fused_rope(
-            query,
-            key,
-            cos_sin,
-            cos_sin_length as i32,
-            cos_sin_stride as i32,
-            index_positions,
-            (b_sz * seq_len) as i32,
-            q_head_size as i32,
-            k_head_size as i32,
-            hidden_size as i32,
-            split_dim as i32,
-            if gpt_neox { 1 } else { 0 },
-        )?;
-        Ok((query.clone(), key.clone()))
-    }
-}
-
-#[cfg(not(feature = "gcu"))]
-pub fn apply_rotary_emb_qkv(
-    q: &Tensor,
-    k: &Tensor,
-    cos: &Tensor,
-    sin: &Tensor,
-    index_pos: &usize,
-    split_dim: usize,
-    query_key_transposed: bool,
-    gpt_neox: bool,
-) -> Result<(Tensor, Tensor)> {
-    if !gpt_neox {
-        panic!("Not supported non-gpt-neox in apply_rotary_emb_qkv!");
-    }
-    use candle::D;
-    fn rotate_half(xs: &Tensor) -> Result<Tensor> {
-        let last_dim = xs.dim(D::Minus1)?;
-        let xs1 = xs.narrow(D::Minus1, 0, last_dim / 2)?;
-        let xs2 = xs.narrow(D::Minus1, last_dim / 2, last_dim - last_dim / 2)?;
-        Tensor::cat(&[&xs2.neg()?, &xs1], D::Minus1)
-    }
-    let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
-    let cos = cos.narrow(0, *index_pos, seq_len)?;
-    let sin = sin.narrow(0, *index_pos, seq_len)?;
-    let cos = cos.unsqueeze(0)?.unsqueeze(0)?; // (1, 1, seq_len, dim)
-    let sin = sin.unsqueeze(0)?.unsqueeze(0)?; // (1, 1, seq_len, dim)
-    let q_embed = (q.broadcast_mul(&cos)? + rotate_half(q)?.broadcast_mul(&sin))?;
-    let k_embed = (k.broadcast_mul(&cos)? + rotate_half(k)?.broadcast_mul(&sin))?;
-    Ok((q_embed, k_embed))
-}
-
-#[cfg(not(feature = "gcu"))]
-pub fn partial_rotary_emb_qkv(
-    query: &Tensor,
-    key: &Tensor,
-    cos_sin: &Tensor,
-    sin: &Tensor,
-    index_pos: usize,
-    split_dim: usize,
-    query_key_transposed: bool,
-) -> Result<(Tensor, Tensor)> {
-    let (_b_size, _num_heads, _seq_len, _headdim) = query.dims4()?; //must be this type of inputs
-    use candle::D;
-    let (rot_ndims, pass_ndims) = (split_dim, _headdim - split_dim);
-    let query_rot = query.narrow(D::Minus1, 0, rot_ndims)?;
-    let query_pass = query.narrow(D::Minus1, rot_ndims, pass_ndims)?;
-    let key_rot = key.narrow(D::Minus1, 0, rot_ndims)?;
-    let key_pass = key.narrow(D::Minus1, rot_ndims, pass_ndims)?;
-    let (query_rot, key_rot) = apply_rotary_emb_qkv(
-        &query_rot,
-        &key_rot,
-        &cos_sin,
-        &sin,
-        &index_pos,
-        0,
-        query_key_transposed,
-        true,
-    )?;
-    let query_states = Tensor::cat(&[query_rot, query_pass], D::Minus1)?.contiguous()?;
-    let key_states = Tensor::cat(&[key_rot, key_pass], D::Minus1)?.contiguous()?;
-    Ok((query_states, key_states))
-}
-
-#[cfg(feature = "gcu")]
-pub fn kvconcat(ltensor: &Tensor, rtensor: &Tensor, concat_dim: i32) -> Result<Tensor> {
-    use candle::gcu_backend::KVConcat;
-    let op = KVConcat { concat_dim };
-    //inputs for kvconcat must be contiguous tensors
-    if ltensor.is_contiguous() && rtensor.is_contiguous() {
-        ltensor.apply_op2(rtensor, op)
-    } else if ltensor.is_contiguous() {
-        ltensor.apply_op2(&rtensor.contiguous()?, op)
-    } else if rtensor.is_contiguous() {
-        let ltensor = ltensor.contiguous()?;
-        ltensor.apply_op2(rtensor, op)
-    } else {
-        let ltensor = ltensor.contiguous()?;
-        let rtensor = rtensor.contiguous()?;
-        ltensor.apply_op2(&rtensor, op)
-    }
-}
-
-#[cfg(not(feature = "gcu"))]
-pub fn kvconcat(ltensor: &Tensor, rtensor: &Tensor, concat_dim: i32) -> Result<Tensor> {
-    Tensor::cat(&[ltensor, &rtensor], concat_dim as usize)?
-}
-
-#[cfg(feature = "gcu")]
-pub fn silu(xs: &Tensor) -> Result<Tensor> {
-    use candle::gcu_backend::Activation;
-    let op = Activation::Silu;
-    if xs.is_contiguous() {
-        xs.apply_op1(op)
-    } else {
-        xs.contiguous()?.apply_op1(op)
-    }
-}
-
-#[cfg(feature = "gcu")]
-pub fn relu(xs: &Tensor) -> Result<Tensor> {
-    use candle::gcu_backend::Activation;
-    let op = Activation::ReLU;
-    if xs.is_contiguous() {
-        xs.apply_op1(op)
-    } else {
-        xs.contiguous()?.apply_op1(op)
-    }
-}
-
-#[cfg(feature = "gcu")]
-pub fn gelu(xs: &Tensor) -> Result<Tensor> {
-    use candle::gcu_backend::Activation;
-    let op = Activation::GeLU;
-    if xs.is_contiguous() {
-        xs.apply_op1(op)
-    } else {
-        xs.contiguous()?.apply_op1(op)
-    }
-}
-
-#[cfg(feature = "gcu")]
-pub fn tanh(xs: &Tensor) -> Result<Tensor> {
-    use candle::gcu_backend::Activation;
-    let op = Activation::Tanh;
-    if xs.is_contiguous() {
-        xs.apply_op1(op)
-    } else {
-        xs.contiguous()?.apply_op1(op)
-    }
-}
-
-#[cfg(feature = "gcu")]
-pub fn sigmoid(xs: &Tensor) -> Result<Tensor> {
-    use candle::gcu_backend::Activation;
-    let op = Activation::Sigmoid;
-    if xs.is_contiguous() {
-        xs.apply_op1(op)
-    } else {
-        xs.contiguous()?.apply_op1(op)
-    }
-}
-
-#[cfg(feature = "gcu")]
-pub fn elu(xs: &Tensor, alpha: f64) -> Result<Tensor> {
-    use candle::gcu_backend::Activation;
-    let op = Activation::Elu(alpha);
-    if xs.is_contiguous() {
-        xs.apply_op1(op)
-    } else {
-        xs.contiguous()?.apply_op1(op)
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct Identity;
 
@@ -1272,36 +1174,6 @@ impl Module for Identity {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         Ok(xs.clone())
     }
-}
-
-#[cfg(feature = "gcu")]
-pub fn gptq_matmul(
-    x: &Tensor,
-    qweight: &Tensor,
-    scale: &Tensor,
-    qzeros: &Option<Tensor>,
-    g_idx: &Option<Tensor>,
-    workspace: &Option<Tensor>,
-    bits: i32,
-    group_size: i32,
-    is_awq: bool,
-) -> Result<Tensor> {
-    use candle::gcu_backend::GPTQMatMul;
-    let op = GPTQMatMul {
-        qzeros: qzeros.to_owned(),
-        g_idx: g_idx.to_owned(),
-        workspace: workspace.to_owned(),
-        bits,
-        group_size,
-    };
-    x.apply_op3(qweight, scale, op)
-}
-
-#[cfg(feature = "gcu")]
-pub fn marlin_weight_repack(qweight: &Tensor, bits: i32, is_awq: bool) -> Result<Tensor> {
-    use candle::gcu_backend::GPTQRepack;
-    let op = GPTQRepack { bits: 4 };
-    qweight.apply_op1(op)
 }
 
 #[allow(dead_code)]
@@ -1547,205 +1419,413 @@ pub fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32, softcapping: f32) ->
     q.apply_op3_no_bwd(k, v, &Sdpa { scale, softcapping })
 }
 
-use crate::var_builder::ShardedVarBuilder as VarBuilder;
-use crate::Linear;
-use candle::backend::BackendStorage;
-#[cfg(feature = "nccl")]
-pub use candle::cuda_backend::cudarc::nccl::safe::{Comm, ReduceOp};
-#[cfg(feature = "eccl")]
-pub use candle::gcu_backend::ubridge::eccl::{Comm, Id, ReduceOp};
-use candle::CustomOp1;
-pub use std::rc::Rc;
+#[derive(Debug, Clone)]
+struct MXFP4Dequant {
+    out_dtype: DType,
+    group_size: usize,
+}
 
-#[cfg(all(not(feature = "nccl"), not(feature = "eccl")))]
-struct Comm {}
+impl MXFP4Dequant {
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd_t<
+        T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
+    >(
+        &self,
+        s1: &candle::CudaStorage,
+        l1: &Layout, // weight
+        s2: &candle::CudaStorage,
+        l2: &Layout, // scales
+    ) -> Result<(candle::CudaStorage, Shape)> {
+        use candle::backend::BackendStorage;
+        use candle::cuda_backend::cudarc::driver::{LaunchAsync, LaunchConfig};
+        use candle::cuda_backend::{kernels, WrapErr};
 
-#[cfg(all(not(feature = "nccl"), not(feature = "eccl")))]
-impl Comm {
-    //dummy Comm
-    fn rank(&self) -> i32 {
-        0
+        let dev = s1.device();
+        let dims = l1.shape().dims();
+
+        // Flatten leading dimensions to get a 2D-like view for the kernel
+        let num_rows: usize = dims[..dims.len() - 1].iter().product();
+        let packed_row_len = dims[dims.len() - 1];
+        let weights_per_row = packed_row_len * 2; // 2 values per byte
+        let total_elements = num_rows * weights_per_row;
+        // println!("dims {:?}, num_rows {num_rows}, packed_row_len {packed_row_len}, weights_per_row {weights_per_row}", dims);
+
+        let kernel_name = match self.out_dtype {
+            DType::F32 => "dequantize_mxfp4_f32",
+            DType::F16 => "dequantize_mxfp4_f16",
+            DType::BF16 => "dequantize_mxfp4_bf16",
+            _ => candle::bail!("unsupported mxfp4-dequant output type {:?}", self.out_dtype),
+        };
+
+        // Allocate destination buffer
+        let dst = unsafe { dev.alloc::<T>(total_elements).w()? };
+
+        let groups_per_row = weights_per_row / self.group_size;
+        let threads_per_block = 256;
+        let blocks_per_grid = (total_elements + threads_per_block - 1) / threads_per_block;
+        // println!("groups_per_row {groups_per_row}, threads_per_block {threads_per_block}, blocks_per_grid {blocks_per_grid}");
+
+        let cfg = LaunchConfig {
+            grid_dim: (blocks_per_grid as u32, 1, 1),
+            block_dim: (threads_per_block as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let func = dev.get_or_load_func(kernel_name, kernels::QUANTIZED)?;
+
+        let src_full = s1.as_cuda_slice::<u8>()?;
+        let scale_full = s2.as_cuda_slice::<u8>()?;
+
+        let src = src_full.slice(l1.start_offset()..);
+        let scale = scale_full.slice(l2.start_offset()..);
+
+        let params = (
+            &dst,
+            &src,
+            &scale,
+            total_elements as i64,
+            weights_per_row as i32,
+            packed_row_len as i32,
+            groups_per_row as i32,
+            self.group_size as i32,
+        );
+
+        unsafe { func.launch(cfg, params) }.w()?;
+
+        // Reconstruct the output shape
+        let rank = dims.len();
+        let mut out_dims = dims.to_vec();
+        out_dims[rank - 1] = weights_per_row;
+        // println!("out shape {:?}", out_dims);
+
+        let dst_storage = candle::CudaStorage::wrap_cuda_slice(dst, dev.clone());
+        // dev.synchronize();
+
+        Ok((dst_storage, out_dims.into()))
     }
-    fn world_size(&self) -> i32 {
-        1
-    }
 }
 
-pub struct TensorParallelColumnLinear {
-    linear: Linear,
-}
-
-impl TensorParallelColumnLinear {
-    pub fn new(linear: Linear) -> Self {
-        Self { linear }
-    }
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        self.linear.forward(x)
-    }
-}
-
-pub struct TensorParallelRowLinear {
-    linear: Linear,
-    all_reduce: AllReduce,
-}
-
-struct AllReduce {
-    comm: Rc<Comm>,
-}
-
-unsafe impl Sync for AllReduce {}
-unsafe impl Send for AllReduce {}
-
-impl CustomOp1 for AllReduce {
+impl candle::CustomOp2 for MXFP4Dequant {
     fn name(&self) -> &'static str {
-        "allreduce"
+        "mxfp4-dequant"
     }
 
-    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
-        candle::bail!("AllReduce is never used on cpu")
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        candle::bail!("MXFP4Dequant has no cpu impl")
     }
 
     #[cfg(feature = "cuda")]
     fn cuda_fwd(
         &self,
-        s: &candle::CudaStorage,
-        l: &Layout,
+        s1: &candle::CudaStorage,
+        l1: &Layout, //weight
+        s2: &candle::CudaStorage,
+        l2: &Layout, //scales
     ) -> Result<(candle::CudaStorage, Shape)> {
-        use candle::cuda_backend::cudarc::driver::DeviceSlice;
-        use candle::cuda_backend::WrapErr;
         use half::{bf16, f16};
-
-        let elem_count = l.shape().elem_count();
-        let dev = s.device().clone();
-        let dst = match s.dtype() {
-            DType::BF16 => {
-                let s = s.as_cuda_slice::<bf16>()?;
-                let s = match l.contiguous_offsets() {
-                    Some((0, l)) if l == s.len() => s,
-                    Some(_) | None => candle::bail!("input has to be contiguous"),
-                };
-                let mut dst = unsafe { dev.alloc::<bf16>(elem_count) }.w()?;
-                self.comm
-                    .all_reduce(s, &mut dst, &ReduceOp::Sum)
-                    .map_err(candle::Error::debug)?;
-                candle::CudaStorage::wrap_cuda_slice(dst, dev)
-            }
-            DType::F16 => {
-                let s = s.as_cuda_slice::<f16>()?;
-                let s = match l.contiguous_offsets() {
-                    Some((0, l)) if l == s.len() => s,
-                    Some(_) | None => candle::bail!("input has to be contiguous"),
-                };
-                let mut dst = unsafe { dev.alloc::<f16>(elem_count) }.w()?;
-                self.comm
-                    .all_reduce(s, &mut dst, &ReduceOp::Sum)
-                    .map_err(candle::Error::debug)?;
-                candle::CudaStorage::wrap_cuda_slice(dst, dev)
-            }
-            dtype => candle::bail!("unsupported dtype {dtype:?}"),
-        };
-        Ok((dst, l.shape().clone()))
-    }
-
-    #[cfg(all(feature = "gcu", feature = "eccl"))]
-    fn gcu_fwd(&self, s: &candle::GcuStorage, l: &Layout) -> Result<(candle::GcuStorage, Shape)> {
-        use candle::gcu_backend::ubridge::device_ptr::DeviceSlice;
-        use candle::gcu_backend::WrapErr;
-        use half::{bf16, f16};
-
-        let elem_count = l.shape().elem_count();
-        let dev = s.device().clone();
-        let dst = match s.dtype() {
-            DType::BF16 => {
-                let s = s.as_gcu_slice::<bf16>()?;
-                let s = match l.contiguous_offsets() {
-                    Some((0, l)) if l == s.len() => s,
-                    Some(_) | None => candle::bail!("input has to be contiguous"),
-                };
-                let mut dst = dev.alloc::<bf16>(elem_count).w()?;
-                self.comm
-                    .all_reduce(s, &mut dst, &ReduceOp::Sum)
-                    .map_err(candle::Error::debug)?;
-                candle::GcuStorage::wrap_gcu_slice(dst, dev)
-            }
-            DType::F16 => {
-                let s = s.as_gcu_slice::<f16>()?;
-                let s = match l.contiguous_offsets() {
-                    Some((0, l)) if l == s.len() => s,
-                    Some(_) | None => candle::bail!("input has to be contiguous"),
-                };
-                let mut dst = dev.alloc::<f16>(elem_count).w()?;
-                self.comm
-                    .all_reduce(s, &mut dst, &ReduceOp::Sum)
-                    .map_err(candle::Error::debug)?;
-                candle::GcuStorage::wrap_gcu_slice(dst, dev)
-            }
-            DType::F32 => {
-                let s = s.as_gcu_slice::<f32>()?;
-                let s = match l.contiguous_offsets() {
-                    Some((0, l)) if l == s.len() => s,
-                    Some(_) | None => candle::bail!("input has to be contiguous"),
-                };
-                let mut dst = dev.alloc::<f32>(elem_count).w()?;
-                self.comm
-                    .all_reduce(s, &mut dst, &ReduceOp::Sum)
-                    .map_err(candle::Error::debug)?;
-                candle::GcuStorage::wrap_gcu_slice(dst, dev)
-            }
-            dtype => candle::bail!("unsupported dtype {dtype:?}"),
-        };
-        Ok((dst, l.shape().clone()))
+        match self.out_dtype {
+            candle::DType::F16 => self.cuda_fwd_t::<f16>(s1, l1, s2, l2),
+            candle::DType::BF16 => self.cuda_fwd_t::<bf16>(s1, l1, s2, l2),
+            candle::DType::F32 => self.cuda_fwd_t::<f32>(s1, l1, s2, l2),
+            dt => candle::bail!("mxfp4-dequant is only supported for f16/bf16 ({dt:?})"),
+        }
     }
 }
-
-impl TensorParallelRowLinear {
-    pub fn new(linear: Linear, comm: Rc<Comm>) -> Self {
-        let all_reduce = AllReduce { comm };
-        Self { linear, all_reduce }
+pub fn dequant_mxfp4(
+    weight: &Tensor,
+    scales: &Tensor,
+    out_dtype: DType,
+    group_size: usize,
+) -> Result<Tensor> {
+    if !weight.is_contiguous() {
+        candle::bail!("weight must be contiguous");
     }
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        self.linear.forward(x)?.apply_op1_no_bwd(&self.all_reduce)
+    if !scales.is_contiguous() {
+        candle::bail!("scales must be contiguous");
     }
+    if weight.dtype() != DType::U8 {
+        candle::bail!("weight must be u8");
+    }
+    if scales.dtype() != DType::U8 {
+        candle::bail!("scales must be u8");
+    }
+    if group_size % 32 != 0 {
+        candle::bail!("group size must be a multiple of 32");
+    }
+    weight.apply_op2_no_bwd(
+        scales,
+        &MXFP4Dequant {
+            out_dtype,
+            group_size,
+        },
+    )
 }
 
-pub fn shard(dim: usize, rank: usize, world_size: usize) -> crate::var_builder::Shard {
-    crate::var_builder::Shard {
-        dim,
-        rank,
-        world_size,
-    }
-}
+// === GCU-specific operations (restored from enflame branch) ===
 
-impl TensorParallelColumnLinear {
-    pub fn load(vb: VarBuilder, comm: Rc<Comm>) -> Result<Self> {
-        let rank = comm.rank();
-        let size = comm.world_size();
-        let weight = vb.get_with_hints((), "weight", shard(0, rank as usize, size as usize))?;
-        Ok(Self::new(Linear::new(weight, None)))
-    }
-
-    pub fn load_multi(vb: VarBuilder, prefixes: &[&str], comm: Rc<Comm>) -> Result<Self> {
-        let rank = comm.rank();
-        let size = comm.world_size();
-        let weights: Vec<_> = prefixes
+#[cfg(feature = "gcu")]
+pub fn apply_rotary_emb_qkv(
+    query: &Tensor,
+    key: &Tensor,
+    cos_sin: &Tensor,
+    _: &Tensor,
+    index_positions: &Tensor,
+    split_dim: usize,
+    query_key_transposed: bool,
+    gpt_neox: bool,
+) -> Result<(Tensor, Tensor)> {
+    let index_positions: Vec<i32> = if index_positions.dtype() == candle::DType::I64 {
+        index_positions
+            .to_vec1::<i64>()?
             .iter()
-            .map(|p| {
-                vb.pp(p)
-                    .get_with_hints((), "weight", shard(0, rank as usize, size as usize))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let weight = Tensor::cat(&weights, 0)?.contiguous()?;
-        Ok(Self::new(Linear::new(weight, None)))
+            .map(|&v| v as i32)
+            .collect()
+    } else {
+        index_positions.to_vec1()?
+    };
+    let index_positions = &index_positions;
+    pub fn fused_rope(
+        query: &Tensor,
+        key: &Tensor,
+        cos_sin: &Tensor,
+        cos_sin_length: i32,
+        cos_sin_stride: i32,
+        index_positions: &Vec<i32>,
+        batch: i32,
+        num_tokens: i32,
+        q_head_size: i32,
+        k_head_size: i32,
+        hidden_size: i32,
+        split_dim: i32, //used for partial rope
+        gpt_neox: i32,
+    ) -> Result<Tensor> {
+        use candle::gcu_backend::Rope;
+        let idx_i64: Vec<i64> = index_positions.iter().map(|&v| v as i64).collect();
+        let idx_tensor = Tensor::new(idx_i64.as_slice(), query.device())?;
+        let op = Rope {
+            cos_sin_length,
+            cos_sin_stride,
+            index_positions: idx_tensor,
+            num_tokens,
+            q_head_size,
+            k_head_size,
+            hidden_size,
+            split_dim,
+            gpt_neox,
+        };
+        query.apply_op3(key, cos_sin, op)
+    }
+    let cos_sin_dims = cos_sin.shape().dims();
+    let cos_sin_length = cos_sin_dims[0];
+    let cos_sin_stride = cos_sin_dims[cos_sin_dims.len() - 1];
+    if query_key_transposed {
+        //(b_sz, num_heads, seq_len, hidden_size)
+        let (b_sz, q_head_size, seq_len, hidden_size) = query.dims4()?;
+        let (_, k_head_size, _, _) = key.dims4()?;
+        let _ = fused_rope(
+            query,
+            key,
+            cos_sin,
+            cos_sin_length as i32,
+            cos_sin_stride as i32,
+            index_positions,
+            b_sz as i32,
+            seq_len as i32,
+            q_head_size as i32,
+            k_head_size as i32,
+            hidden_size as i32,
+            split_dim as i32,
+            if gpt_neox { 1 } else { 0 },
+        )?;
+        Ok((query.contiguous()?, key.contiguous()?))
+    } else {
+        //NOTE: gpt_neox not for ChatGLM, seq_len in dim1 not for ChatGLM
+        //(b_sz, seq_len, num_heads, hidden_size)
+        let (b_sz, seq_len, q_head_size, hidden_size) = query.dims4()?;
+        let (_, _, k_head_size, _) = key.dims4()?;
+        let _ = fused_rope(
+            query,
+            key,
+            cos_sin,
+            cos_sin_length as i32,
+            cos_sin_stride as i32,
+            index_positions,
+            b_sz as i32,
+            seq_len as i32,
+            q_head_size as i32,
+            k_head_size as i32,
+            hidden_size as i32,
+            split_dim as i32,
+            if gpt_neox { 1 } else { 0 },
+        )?;
+        Ok((query.clone(), key.clone()))
     }
 }
 
-impl TensorParallelRowLinear {
-    pub fn load(vb: VarBuilder, comm: Rc<Comm>) -> Result<Self> {
-        let rank = comm.rank();
-        let size = comm.world_size();
-        let weight = vb.get_with_hints((), "weight", shard(1, rank as usize, size as usize))?;
-        Ok(Self::new(Linear::new(weight, None), comm))
+#[cfg(not(feature = "gcu"))]
+pub fn apply_rotary_emb_qkv(
+    q: &Tensor,
+    k: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    index_pos: usize,
+    split_dim: usize,
+    query_key_transposed: bool,
+    gpt_neox: bool,
+) -> Result<(Tensor, Tensor)> {
+    if !gpt_neox {
+        panic!("Not supported non-gpt-neox in apply_rotary_emb_qkv!");
     }
+    use candle::D;
+    fn rotate_half(xs: &Tensor) -> Result<Tensor> {
+        let last_dim = xs.dim(D::Minus1)?;
+        let xs1 = xs.narrow(D::Minus1, 0, last_dim / 2)?;
+        let xs2 = xs.narrow(D::Minus1, last_dim / 2, last_dim - last_dim / 2)?;
+        Tensor::cat(&[&xs2.neg()?, &xs1], D::Minus1)
+    }
+    let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
+    let cos = cos.narrow(0, index_pos, seq_len)?;
+    let sin = sin.narrow(0, index_pos, seq_len)?;
+    let cos = cos.unsqueeze(0)?.unsqueeze(0)?; // (1, 1, seq_len, dim)
+    let sin = sin.unsqueeze(0)?.unsqueeze(0)?; // (1, 1, seq_len, dim)
+    let q_embed = (q.broadcast_mul(&cos)? + rotate_half(q)?.broadcast_mul(&sin))?;
+    let k_embed = (k.broadcast_mul(&cos)? + rotate_half(k)?.broadcast_mul(&sin))?;
+    Ok((q_embed, k_embed))
+}
+
+#[cfg(not(feature = "gcu"))]
+pub fn partial_rotary_emb_qkv(
+    query: &Tensor,
+    key: &Tensor,
+    cos_sin: &Tensor,
+    sin: &Tensor,
+    index_pos: usize,
+    split_dim: usize,
+    query_key_transposed: bool,
+) -> Result<(Tensor, Tensor)> {
+    let (_b_size, _num_heads, _seq_len, _headdim) = query.dims4()?; //must be this type of inputs
+    use candle::D;
+    let (rot_ndims, pass_ndims) = (split_dim, _headdim - split_dim);
+    let query_rot = query.narrow(D::Minus1, 0, rot_ndims)?;
+    let query_pass = query.narrow(D::Minus1, rot_ndims, pass_ndims)?;
+    let key_rot = key.narrow(D::Minus1, 0, rot_ndims)?;
+    let key_pass = key.narrow(D::Minus1, rot_ndims, pass_ndims)?;
+    let (query_rot, key_rot) = apply_rotary_emb_qkv(
+        &query_rot,
+        &key_rot,
+        &cos_sin,
+        &sin,
+        index_pos,
+        0,
+        query_key_transposed,
+        true,
+    )?;
+    let query_states = Tensor::cat(&[query_rot, query_pass], D::Minus1)?.contiguous()?;
+    let key_states = Tensor::cat(&[key_rot, key_pass], D::Minus1)?.contiguous()?;
+    Ok((query_states, key_states))
+}
+
+#[cfg(feature = "gcu")]
+pub fn kvconcat(ltensor: &Tensor, rtensor: &Tensor, concat_dim: i32) -> Result<Tensor> {
+    use candle::gcu_backend::KVConcat;
+    let op = KVConcat { concat_dim };
+    //inputs for kvconcat must be contiguous tensors
+    if ltensor.is_contiguous() && rtensor.is_contiguous() {
+        ltensor.apply_op2(rtensor, op)
+    } else if ltensor.is_contiguous() {
+        ltensor.apply_op2(&rtensor.contiguous()?, op)
+    } else if rtensor.is_contiguous() {
+        let ltensor = ltensor.contiguous()?;
+        ltensor.apply_op2(rtensor, op)
+    } else {
+        let ltensor = ltensor.contiguous()?;
+        let rtensor = rtensor.contiguous()?;
+        ltensor.apply_op2(&rtensor, op)
+    }
+}
+
+#[cfg(not(feature = "gcu"))]
+pub fn kvconcat(ltensor: &Tensor, rtensor: &Tensor, concat_dim: i32) -> Result<Tensor> {
+    Tensor::cat(&[ltensor, &rtensor], concat_dim as usize)?.contiguous()
+}
+
+#[cfg(feature = "gcu")]
+pub fn silu(xs: &Tensor) -> Result<Tensor> {
+    use candle::gcu_backend::Activation;
+    let op = Activation::Silu;
+    if xs.is_contiguous() {
+        xs.apply_op1(op)
+    } else {
+        xs.contiguous()?.apply_op1(op)
+    }
+}
+
+#[cfg(feature = "gcu")]
+pub fn relu(xs: &Tensor) -> Result<Tensor> {
+    use candle::gcu_backend::Activation;
+    let op = Activation::ReLU;
+    if xs.is_contiguous() {
+        xs.apply_op1(op)
+    } else {
+        xs.contiguous()?.apply_op1(op)
+    }
+}
+
+#[cfg(feature = "gcu")]
+pub fn gelu(xs: &Tensor) -> Result<Tensor> {
+    use candle::gcu_backend::Activation;
+    let op = Activation::GeLU;
+    if xs.is_contiguous() {
+        xs.apply_op1(op)
+    } else {
+        xs.contiguous()?.apply_op1(op)
+    }
+}
+
+#[cfg(feature = "gcu")]
+pub fn tanh(xs: &Tensor) -> Result<Tensor> {
+    use candle::gcu_backend::Activation;
+    let op = Activation::Tanh;
+    if xs.is_contiguous() {
+        xs.apply_op1(op)
+    } else {
+        xs.contiguous()?.apply_op1(op)
+    }
+}
+
+#[cfg(feature = "gcu")]
+pub fn gptq_matmul(
+    x: &Tensor,
+    qweight: &Tensor,
+    scale: &Tensor,
+    qzeros: &Option<Tensor>,
+    g_idx: &Option<Tensor>,
+    workspace: &Option<Tensor>,
+    bits: i32,
+    group_size: i32,
+    is_awq: bool,
+) -> Result<Tensor> {
+    use candle::gcu_backend::GPTQMatMul;
+    let op = GPTQMatMul {
+        qzeros: qzeros.to_owned(),
+        g_idx: g_idx.to_owned(),
+        workspace: workspace.to_owned(),
+        bits,
+        group_size,
+    };
+    x.apply_op3(qweight, scale, op)
+}
+
+#[cfg(feature = "gcu")]
+pub fn marlin_weight_repack(qweight: &Tensor, bits: i32, is_awq: bool) -> Result<Tensor> {
+    use candle::gcu_backend::GPTQRepack;
+    let op = GPTQRepack { bits: 4 };
+    qweight.apply_op1(op)
 }
 
 #[cfg(feature = "gcu")]
@@ -1821,7 +1901,7 @@ fn update_cache<
     let v = v.as_gcu_slice::<T>()?;
     let kc = kc.as_gcu_slice::<T>()?;
     let vc = vc.as_gcu_slice::<T>()?;
-    let s = s.as_gcu_slice::<i64>()?;
+    let s = s.as_gcu_slice::<i32>()?;
 
     // Get cuda views for all tensors
     let k = k.slice(k_l.start_offset()..);
@@ -1922,7 +2002,7 @@ pub fn paged_attention<
     use candle::gcu_backend::{kernel_name, WrapErr};
     use candle::GcuStorage;
     use candle::Storage;
-    let dev = q.device();
+    let dev = &q.device;
     let out_shape = q_l.shape().clone();
 
     let (kc, kc_l) = key_cache.storage_and_layout();
@@ -2520,6 +2600,7 @@ pub fn expert_mask(input: &Tensor, v: u32) -> Result<Tensor> {
 //weight [128, 768, 2048]
 //indices [3355, 8]
 //output [3355, 8, 768]
+
 #[cfg(feature = "gcu")]
 fn indexed_moe_func<
     T: candle::gcu_backend::GcuDType + candle::gcu_backend::DeviceCopy + candle::WithDType,
@@ -2651,151 +2732,4 @@ pub fn indexed_moe(input: &Tensor, weight: &Tensor, indices: &Tensor) -> Result<
             candle::bail!("indexed_moe is only supported for f16 and bf16 ({dt:?})")
         }
     }
-}
-
-#[derive(Debug, Clone)]
-struct MXFP4Dequant {
-    out_dtype: DType,
-    group_size: usize,
-}
-
-impl MXFP4Dequant {
-    #[cfg(feature = "cuda")]
-    fn cuda_fwd_t<
-        T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
-    >(
-        &self,
-        s1: &candle::CudaStorage,
-        l1: &Layout, // weight
-        s2: &candle::CudaStorage,
-        l2: &Layout, // scales
-    ) -> Result<(candle::CudaStorage, Shape)> {
-        use candle::backend::BackendStorage;
-        use candle::cuda_backend::cudarc::driver::{LaunchAsync, LaunchConfig};
-        use candle::cuda_backend::{kernels, WrapErr};
-
-        let dev = s1.device();
-        let dims = l1.shape().dims();
-
-        // Flatten leading dimensions to get a 2D-like view for the kernel
-        let num_rows: usize = dims[..dims.len() - 1].iter().product();
-        let packed_row_len = dims[dims.len() - 1];
-        let weights_per_row = packed_row_len * 2; // 2 values per byte
-        let total_elements = num_rows * weights_per_row;
-        // println!("dims {:?}, num_rows {num_rows}, packed_row_len {packed_row_len}, weights_per_row {weights_per_row}", dims);
-
-        let kernel_name = match self.out_dtype {
-            DType::F32 => "dequantize_mxfp4_f32",
-            DType::F16 => "dequantize_mxfp4_f16",
-            DType::BF16 => "dequantize_mxfp4_bf16",
-            _ => candle::bail!("unsupported mxfp4-dequant output type {:?}", self.out_dtype),
-        };
-
-        // Allocate destination buffer
-        let dst = unsafe { dev.alloc::<T>(total_elements).w()? };
-
-        let groups_per_row = weights_per_row / self.group_size;
-        let threads_per_block = 256;
-        let blocks_per_grid = (total_elements + threads_per_block - 1) / threads_per_block;
-        // println!("groups_per_row {groups_per_row}, threads_per_block {threads_per_block}, blocks_per_grid {blocks_per_grid}");
-
-        let cfg = LaunchConfig {
-            grid_dim: (blocks_per_grid as u32, 1, 1),
-            block_dim: (threads_per_block as u32, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let func = dev.get_or_load_func(kernel_name, kernels::QUANTIZED)?;
-
-        let src_full = s1.as_cuda_slice::<u8>()?;
-        let scale_full = s2.as_cuda_slice::<u8>()?;
-
-        let src = src_full.slice(l1.start_offset()..);
-        let scale = scale_full.slice(l2.start_offset()..);
-
-        let params = (
-            &dst,
-            &src,
-            &scale,
-            total_elements as i64,
-            weights_per_row as i32,
-            packed_row_len as i32,
-            groups_per_row as i32,
-            self.group_size as i32,
-        );
-
-        unsafe { func.launch(cfg, params) }.w()?;
-
-        // Reconstruct the output shape
-        let rank = dims.len();
-        let mut out_dims = dims.to_vec();
-        out_dims[rank - 1] = weights_per_row;
-        // println!("out shape {:?}", out_dims);
-
-        let dst_storage = candle::CudaStorage::wrap_cuda_slice(dst, dev.clone());
-        // dev.synchronize();
-
-        Ok((dst_storage, out_dims.into()))
-    }
-}
-
-impl candle::CustomOp2 for MXFP4Dequant {
-    fn name(&self) -> &'static str {
-        "mxfp4-dequant"
-    }
-
-    fn cpu_fwd(
-        &self,
-        _: &CpuStorage,
-        _: &Layout,
-        _: &CpuStorage,
-        _: &Layout,
-    ) -> Result<(CpuStorage, Shape)> {
-        candle::bail!("MXFP4Dequant has no cpu impl")
-    }
-
-    #[cfg(feature = "cuda")]
-    fn cuda_fwd(
-        &self,
-        s1: &candle::CudaStorage,
-        l1: &Layout, //weight
-        s2: &candle::CudaStorage,
-        l2: &Layout, //scales
-    ) -> Result<(candle::CudaStorage, Shape)> {
-        use half::{bf16, f16};
-        match self.out_dtype {
-            candle::DType::F16 => self.cuda_fwd_t::<f16>(s1, l1, s2, l2),
-            candle::DType::BF16 => self.cuda_fwd_t::<bf16>(s1, l1, s2, l2),
-            candle::DType::F32 => self.cuda_fwd_t::<f32>(s1, l1, s2, l2),
-            dt => candle::bail!("flash-attn is only supported for f16/bf16 ({dt:?})"),
-        }
-    }
-}
-pub fn dequant_mxfp4(
-    weight: &Tensor,
-    scales: &Tensor,
-    out_dtype: DType,
-    group_size: usize,
-) -> Result<Tensor> {
-    if !weight.is_contiguous() {
-        candle::bail!("weight must be contiguous");
-    }
-    if !scales.is_contiguous() {
-        candle::bail!("scales must be contiguous");
-    }
-    if weight.dtype() != DType::U8 {
-        candle::bail!("weight must be u8");
-    }
-    if scales.dtype() != DType::U8 {
-        candle::bail!("scales must be u8");
-    }
-    if group_size % 32 != 0 {
-        candle::bail!("group size must be a multiple of 32");
-    }
-    weight.apply_op2_no_bwd(
-        scales,
-        &MXFP4Dequant {
-            out_dtype,
-            group_size,
-        },
-    )
 }

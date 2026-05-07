@@ -110,12 +110,10 @@ impl OffloadBuffer {
                 }
             }
             #[cfg(feature = "cuda")]
-            Device::Cuda(_) => {
-                unsafe {
-                    ptr_host = result::malloc_host(size, 1).unwrap();
-                    std::ptr::copy(src.as_ptr() as *mut core::ffi::c_void, ptr_host, size);
-                }
-            }
+            Device::Cuda(_) => unsafe {
+                ptr_host = result::malloc_host(size, 1).unwrap();
+                std::ptr::copy(src.as_ptr() as *mut core::ffi::c_void, ptr_host, size);
+            },
             _ => {
                 crate::bail!("offload buffer only for cuda or gcu device tensors")
             }
@@ -134,69 +132,74 @@ impl OffloadBuffer {
             #[cfg(feature = "gcu")]
             Device::Gcu(dev) => {
                 let storage = match self.dtype {
-                    DType::BF16 => crate::Storage::Gcu(dev.storage_from_buffer(
-                        self.ptr_host as *mut bf16,
-                        self.len,
-                    )?),
-                    DType::F16 => crate::Storage::Gcu(dev.storage_from_buffer(
-                        self.ptr_host as *mut f16,
-                        self.len,
-                    )?),
-                    DType::F32 => crate::Storage::Gcu(dev.storage_from_buffer(
-                        self.ptr_host as *mut f32,
-                        self.len,
-                    )?),
-                    DType::U8 => crate::Storage::Gcu(dev.storage_from_buffer(
-                        self.ptr_host as *mut u8,
-                        self.len,
-                    )?),
-                    DType::U32 => crate::Storage::Gcu(dev.storage_from_buffer(
-                        self.ptr_host as *mut u32,
-                        self.len,
-                    )?),
-                    DType::I8 => crate::Storage::Gcu(dev.storage_from_buffer(
-                        self.ptr_host as *mut i8,
-                        self.len,
-                    )?),
-                    DType::I32 => crate::Storage::Gcu(dev.storage_from_buffer(
-                        self.ptr_host as *mut i32,
-                        self.len,
-                    )?),
-                    DType::I64 => crate::Storage::Gcu(dev.storage_from_buffer(
-                        self.ptr_host as *mut i64,
-                        self.len,
-                    )?),
-                    DType::F64 => crate::Storage::Gcu(dev.storage_from_buffer(
-                        self.ptr_host as *mut f64,
-                        self.len,
-                    )?),
+                    DType::BF16 => crate::Storage::Gcu(
+                        dev.storage_from_buffer(self.ptr_host as *mut bf16, self.len)?,
+                    ),
+                    DType::F16 => crate::Storage::Gcu(
+                        dev.storage_from_buffer(self.ptr_host as *mut f16, self.len)?,
+                    ),
+                    DType::F32 => crate::Storage::Gcu(
+                        dev.storage_from_buffer(self.ptr_host as *mut f32, self.len)?,
+                    ),
+                    DType::U8 => crate::Storage::Gcu(
+                        dev.storage_from_buffer(self.ptr_host as *mut u8, self.len)?,
+                    ),
+                    DType::U32 => crate::Storage::Gcu(
+                        dev.storage_from_buffer(self.ptr_host as *mut u32, self.len)?,
+                    ),
+                    DType::I8 => crate::Storage::Gcu(
+                        dev.storage_from_buffer(self.ptr_host as *mut i8, self.len)?,
+                    ),
+                    DType::I32 => crate::Storage::Gcu(
+                        dev.storage_from_buffer(self.ptr_host as *mut i32, self.len)?,
+                    ),
+                    DType::I64 => crate::Storage::Gcu(
+                        dev.storage_from_buffer(self.ptr_host as *mut i64, self.len)?,
+                    ),
+                    DType::F64 => crate::Storage::Gcu(
+                        dev.storage_from_buffer(self.ptr_host as *mut f64, self.len)?,
+                    ),
                 };
                 Ok(storage)
             }
             #[cfg(feature = "cuda")]
             Device::Cuda(dev) => {
                 let storage = match self.dtype {
-                    DType::BF16 => {
-                        Storage::Cuda(storage_from_buffer(self.ptr_host as *mut bf16, self.len, dev)?)
-                    }
-                    DType::F16 => {
-                        Storage::Cuda(storage_from_buffer(self.ptr_host as *mut f16, self.len, dev)?)
-                    }
-                    DType::F32 => {
-                        Storage::Cuda(storage_from_buffer(self.ptr_host as *mut f32, self.len, dev)?)
-                    }
-                    DType::U8 => {
-                        Storage::Cuda(storage_from_buffer(self.ptr_host as *mut u8, self.len, dev)?)
-                    }
-                    DType::U32 => {
-                        Storage::Cuda(storage_from_buffer(self.ptr_host as *mut u32, self.len, dev)?)
-                    }
-                    DType::I64 => {
-                        Storage::Cuda(storage_from_buffer(self.ptr_host as *mut i64, self.len, dev)?)
-                    }
-                    DType::F64 => {
-                        Storage::Cuda(storage_from_buffer(self.ptr_host as *mut f64, self.len, dev)?)
-                    }
+                    DType::BF16 => Storage::Cuda(storage_from_buffer(
+                        self.ptr_host as *mut bf16,
+                        self.len,
+                        dev,
+                    )?),
+                    DType::F16 => Storage::Cuda(storage_from_buffer(
+                        self.ptr_host as *mut f16,
+                        self.len,
+                        dev,
+                    )?),
+                    DType::F32 => Storage::Cuda(storage_from_buffer(
+                        self.ptr_host as *mut f32,
+                        self.len,
+                        dev,
+                    )?),
+                    DType::U8 => Storage::Cuda(storage_from_buffer(
+                        self.ptr_host as *mut u8,
+                        self.len,
+                        dev,
+                    )?),
+                    DType::U32 => Storage::Cuda(storage_from_buffer(
+                        self.ptr_host as *mut u32,
+                        self.len,
+                        dev,
+                    )?),
+                    DType::I64 => Storage::Cuda(storage_from_buffer(
+                        self.ptr_host as *mut i64,
+                        self.len,
+                        dev,
+                    )?),
+                    DType::F64 => Storage::Cuda(storage_from_buffer(
+                        self.ptr_host as *mut f64,
+                        self.len,
+                        dev,
+                    )?),
                 };
                 Ok(storage)
             }
@@ -219,11 +222,9 @@ impl Drop for OffloadBuffer {
                 }
             }
             #[cfg(feature = "cuda")]
-            Device::Cuda(_) => {
-                unsafe {
-                    let _ = result::free_host(self.ptr_host);
-                }
-            }
+            Device::Cuda(_) => unsafe {
+                let _ = result::free_host(self.ptr_host);
+            },
             _ => {}
         }
     }

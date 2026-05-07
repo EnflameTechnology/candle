@@ -2477,15 +2477,42 @@ impl BackendStorage for GcuStorage {
 
     fn copy2d(
         &self,
-        _dst: &mut Self,
-        _d1: usize,
-        _d2: usize,
-        _src_s: usize,
-        _dst_s: usize,
-        _src_o: usize,
-        _dst_o: usize,
+        dst: &mut Self,
+        d1: usize,
+        d2: usize,
+        src_s: usize,
+        dst_s: usize,
+        src_o: usize,
+        dst_o: usize,
     ) -> Result<()> {
-        todo!()
+        if d1 == 0 || d2 == 0 {
+            return Ok(());
+        }
+        let dev = &self.device;
+        macro_rules! copy2d_impl {
+            ($src_slice:expr, $dst_slice:expr) => {{
+                for i in 0..d1 {
+                    let s_off = src_o + i * src_s;
+                    let d_off = dst_o + i * dst_s;
+                    let src_row = $src_slice.slice(s_off..s_off + d2);
+                    let mut dst_row = $dst_slice.slice(d_off..d_off + d2);
+                    dev.dtod_copy(&src_row, &mut dst_row).w()?;
+                }
+            }};
+        }
+        match (&self.slice, &mut dst.slice) {
+            (S::U8(s), S::U8(d)) => copy2d_impl!(s, d),
+            (S::I8(s), S::I8(d)) => copy2d_impl!(s, d),
+            (S::U32(s), S::U32(d)) => copy2d_impl!(s, d),
+            (S::I32(s), S::I32(d)) => copy2d_impl!(s, d),
+            (S::I64(s), S::I64(d)) => copy2d_impl!(s, d),
+            (S::BF16(s), S::BF16(d)) => copy2d_impl!(s, d),
+            (S::F16(s), S::F16(d)) => copy2d_impl!(s, d),
+            (S::F32(s), S::F32(d)) => copy2d_impl!(s, d),
+            (S::F64(s), S::F64(d)) => copy2d_impl!(s, d),
+            _ => Err(GcuError::InternalError("dtype mismatch in copy2d"))?,
+        }
+        Ok(())
     }
 
     fn copy_strided_src(&self, dst: &mut Self, dst_offset: usize, src_l: &Layout) -> Result<()> {

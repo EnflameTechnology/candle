@@ -107,30 +107,51 @@ impl LayerNorm {
 
 impl Module for LayerNorm {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        if x.is_contiguous() && self.remove_mean {
-            if let Some(bias) = self.bias.as_ref() {
-                return crate::ops::layer_norm(x, &self.weight, bias, self.eps as f32);
-            }
+        #[cfg(feature = "gcu")]
+        {
+            let x = if x.is_contiguous() {
+                x.clone()
+            } else {
+                x.contiguous()?
+            };
+            let bias_tensor = match &self.bias {
+                Some(b) => b.clone(),
+                None => Tensor::zeros_like(&self.weight)?,
+            };
+            let op = candle::gcu_backend::LayerNorm {
+                eps: self.eps as f32,
+                remove_mean: self.remove_mean,
+                affine: self.bias.is_some(),
+            };
+            return x.apply_op3_no_bwd(&self.weight, &bias_tensor, &op);
         }
-        let x_dtype = x.dtype();
-        let internal_dtype = match x_dtype {
-            DType::F16 | DType::BF16 => DType::F32,
-            d => d,
-        };
-        let hidden_size = x.dim(D::Minus1)?;
-        let x = x.to_dtype(internal_dtype)?;
-        let x = if self.remove_mean {
-            let mean_x = (x.sum_keepdim(D::Minus1)? / hidden_size as f64)?;
-            x.broadcast_sub(&mean_x)?
-        } else {
-            x
-        };
-        let norm_x = (x.sqr()?.sum_keepdim(D::Minus1)? / hidden_size as f64)?;
-        let x_normed = x.broadcast_div(&(norm_x + self.eps)?.sqrt()?)?;
-        let x = x_normed.to_dtype(x_dtype)?.broadcast_mul(&self.weight)?;
-        match &self.bias {
-            None => Ok(x),
-            Some(bias) => x.broadcast_add(bias),
+        #[cfg(not(feature = "gcu"))]
+        {
+            if x.is_contiguous() && self.remove_mean {
+                if let Some(bias) = self.bias.as_ref() {
+                    return crate::ops::layer_norm(x, &self.weight, bias, self.eps as f32);
+                }
+            }
+            let x_dtype = x.dtype();
+            let internal_dtype = match x_dtype {
+                DType::F16 | DType::BF16 => DType::F32,
+                d => d,
+            };
+            let hidden_size = x.dim(D::Minus1)?;
+            let x = x.to_dtype(internal_dtype)?;
+            let x = if self.remove_mean {
+                let mean_x = (x.sum_keepdim(D::Minus1)? / hidden_size as f64)?;
+                x.broadcast_sub(&mean_x)?
+            } else {
+                x
+            };
+            let norm_x = (x.sqr()?.sum_keepdim(D::Minus1)? / hidden_size as f64)?;
+            let x_normed = x.broadcast_div(&(norm_x + self.eps)?.sqrt()?)?;
+            let x = x_normed.to_dtype(x_dtype)?.broadcast_mul(&self.weight)?;
+            match &self.bias {
+                None => Ok(x),
+                Some(bias) => x.broadcast_add(bias),
+            }
         }
     }
 }
@@ -185,10 +206,17 @@ impl RmsNorm {
 
 impl Module for RmsNorm {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        if xs.is_contiguous() {
-            crate::ops::rms_norm(xs, &self.0.weight, self.0.eps as f32)
-        } else {
-            self.0.forward(xs)
+        #[cfg(feature = "gcu")]
+        {
+            return self.0.forward(xs);
+        }
+        #[cfg(not(feature = "gcu"))]
+        {
+            if xs.is_contiguous() {
+                crate::ops::rms_norm(xs, &self.0.weight, self.0.eps as f32)
+            } else {
+                self.0.forward(xs)
+            }
         }
     }
 }
