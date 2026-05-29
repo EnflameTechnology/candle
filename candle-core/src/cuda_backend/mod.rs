@@ -10,6 +10,12 @@ use cudarc::driver::{
     CudaSlice, DevicePtr, DeviceRepr, DeviceSlice, LaunchAsync, LaunchConfig, ValidAsZeroBits,
 };
 use half::{bf16, f16};
+#[cfg(feature = "graph")]
+use std::cell::Cell;
+#[cfg(feature = "graph")]
+use std::collections::HashMap;
+#[cfg(feature = "graph")]
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(feature = "cudnn")]
 pub mod cudnn;
@@ -20,8 +26,55 @@ pub use device::{CudaDevice, DeviceId};
 pub use error::{CudaError, WrapErr};
 pub use utils::{Map1, Map1Any, Map2, Map2Any, Map2InPlace, Map3, S};
 
+#[cfg(feature = "graph")]
+static CUDA_PARAM_CACHE: OnceLock<Mutex<HashMap<(DeviceId, Vec<usize>), Arc<CudaSlice<usize>>>>> =
+    OnceLock::new();
+
+#[cfg(feature = "graph")]
+thread_local! {
+    static CUDA_PARAM_CACHE_ENABLED: Cell<bool> = const { Cell::new(false) };
+}
+
+pub struct CudaParamCacheGuard {
+    #[cfg(feature = "graph")]
+    previous: bool,
+}
+
+#[cfg(feature = "graph")]
+impl Drop for CudaParamCacheGuard {
+    fn drop(&mut self) {
+        CUDA_PARAM_CACHE_ENABLED.with(|enabled| enabled.set(self.previous));
+    }
+}
+
+#[cfg(not(feature = "graph"))]
+impl Drop for CudaParamCacheGuard {
+    fn drop(&mut self) {}
+}
+
+// Enable parameter cache for CUDA kernel launch
+pub fn cuda_param_cache_scope(enabled: bool) -> CudaParamCacheGuard {
+    #[cfg(feature = "graph")]
+    {
+        let previous = CUDA_PARAM_CACHE_ENABLED.with(|cache_enabled| {
+            let previous = cache_enabled.get();
+            cache_enabled.set(enabled);
+            previous
+        });
+        CudaParamCacheGuard { previous }
+    }
+
+    #[cfg(not(feature = "graph"))]
+    {
+        let _ = enabled;
+        CudaParamCacheGuard {}
+    }
+}
+
 pub enum SlicePtrOrNull<T> {
     Ptr(CudaSlice<T>),
+    #[cfg(feature = "graph")]
+    Cached(Arc<CudaSlice<T>>),
     Null,
 }
 
@@ -29,19 +82,42 @@ unsafe impl<T: DeviceRepr> DeviceRepr for &SlicePtrOrNull<T> {
     fn as_kernel_param(&self) -> *mut std::ffi::c_void {
         match self {
             SlicePtrOrNull::Ptr(slice) => slice.as_kernel_param(),
+            #[cfg(feature = "graph")]
+            SlicePtrOrNull::Cached(slice) => slice.as_ref().as_kernel_param(),
             SlicePtrOrNull::Null => 0usize.as_kernel_param(),
         }
     }
 }
 
 impl SlicePtrOrNull<usize> {
+    pub fn params_from_vec(dev: &CudaDevice, params: Vec<usize>) -> Result<Self> {
+        #[cfg(feature = "graph")]
+        if CUDA_PARAM_CACHE_ENABLED.with(|enabled| enabled.get()) {
+            let key = (dev.id(), params.clone());
+            let cache = CUDA_PARAM_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+            if let Some(slice) = cache.lock().unwrap().get(&key).cloned() {
+                return Ok(SlicePtrOrNull::Cached(slice));
+            }
+
+            let is_capturing = cudarc::driver::capture_status(*dev.cu_stream())
+                == Ok(cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE);
+            if !is_capturing {
+                let slice = Arc::new(dev.htod_copy(params).w()?);
+                let mut cache = cache.lock().unwrap();
+                let slice = cache.entry(key).or_insert_with(|| slice).clone();
+                return Ok(SlicePtrOrNull::Cached(slice));
+            }
+        }
+
+        Ok(SlicePtrOrNull::Ptr(dev.htod_copy(params).w()?))
+    }
+
     pub fn params_from_layout(dev: &CudaDevice, l: &Layout) -> Result<Self> {
-        let ds = if l.is_contiguous() {
-            SlicePtrOrNull::Null
+        if l.is_contiguous() {
+            Ok(SlicePtrOrNull::Null)
         } else {
-            SlicePtrOrNull::Ptr(dev.htod_copy([l.dims(), l.stride()].concat()).w()?)
-        };
-        Ok(ds)
+            Self::params_from_vec(dev, [l.dims(), l.stride()].concat())
+        }
     }
 }
 
@@ -154,7 +230,7 @@ impl Map1 for Im2Col1D {
         let l_out = self.l_out(dims[2]);
         let dst_el = dims[0] * l_out * dims[1] * self.l_k;
         let cfg = LaunchConfig::for_num_elems(dst_el as u32);
-        let ds = dev.htod_copy([dims, layout.stride()].concat()).w()?;
+        let ds = SlicePtrOrNull::params_from_vec(dev, [dims, layout.stride()].concat())?;
         let src = &src.slice(layout.start_offset()..);
         let func = dev.get_or_load_func(&kernel_name::<T>("im2col1d"), kernels::CONV)?;
         // SAFETY: Set later by running the kernel.
@@ -206,7 +282,7 @@ impl Map1 for Im2Col {
         let (h_out, w_out) = self.hw_out(dims[2], dims[3]);
         let dst_el = dims[0] * h_out * w_out * dims[1] * self.h_k * self.w_k;
         let cfg = LaunchConfig::for_num_elems(dst_el as u32);
-        let ds = dev.htod_copy([dims, layout.stride()].concat()).w()?;
+        let ds = SlicePtrOrNull::params_from_vec(dev, [dims, layout.stride()].concat())?;
         let src = &src.slice(layout.start_offset()..);
         let func = dev.get_or_load_func(&kernel_name::<T>("im2col"), kernels::CONV)?;
         // SAFETY: Set later by running the kernel.
@@ -314,9 +390,8 @@ impl Map1Any for FastReduce<'_> {
                 name,
             )
         };
-        let ds = dev
-            .htod_copy([dims.as_slice(), stride.as_slice()].concat())
-            .w()?;
+        let ds =
+            SlicePtrOrNull::params_from_vec(dev, [dims.as_slice(), stride.as_slice()].concat())?;
         let src = &src.slice(layout.start_offset()..);
         if check_empty && layout.shape().elem_count() == 0 {
             Err(crate::Error::EmptyTensor { op: "reduce" }.bt())?
@@ -391,7 +466,7 @@ impl Map1 for IndexSelect<'_> {
         };
         let ids_shape = ids_l.shape();
         let ids_dims = ids_shape.dims();
-        let ds = dev.htod_copy([ids_dims, ids_l.stride()].concat()).w()?;
+        let ds = SlicePtrOrNull::params_from_vec(dev, [ids_dims, ids_l.stride()].concat())?;
         let src = match src_l.contiguous_offsets() {
             Some((o1, o2)) => src.slice(o1..o2),
             None => Err(crate::Error::RequiresContiguous { op: "index-select" }.bt())?,
@@ -598,7 +673,7 @@ impl Map2 for Conv1D<'_> {
         } else {
             crate::bail!("unexpected input shape for conv1d {dims:?}")
         };
-        let ds = dev.htod_copy(ds).w()?;
+        let ds = SlicePtrOrNull::params_from_vec(dev, ds)?;
         let params = (
             el, l_out, p.stride, p.padding, p.dilation, &ds, inp, k, &out,
         );
@@ -638,7 +713,7 @@ impl Map2 for Conv2D<'_> {
         } else {
             crate::bail!("unexpected input shape for conv2d {dims:?}")
         };
-        let ds = dev.htod_copy(ds).w()?;
+        let ds = SlicePtrOrNull::params_from_vec(dev, ds)?;
         let params = (
             el, out_w, out_h, p.stride, p.padding, p.dilation, &ds, inp, k, &out,
         );
@@ -703,7 +778,7 @@ impl Map2 for ConvTranspose1D<'_> {
         } else {
             crate::bail!("unexpected input shape for conv_transpose1d {dims:?}")
         };
-        let ds = dev.htod_copy(ds).w()?;
+        let ds = SlicePtrOrNull::params_from_vec(dev, ds)?;
         let params = (
             el,
             l_out,
@@ -752,7 +827,7 @@ impl Map2 for ConvTranspose2D<'_> {
         } else {
             crate::bail!("unexpected input shape for conv_transpose2d {dims:?}")
         };
-        let ds = dev.htod_copy(ds).w()?;
+        let ds = SlicePtrOrNull::params_from_vec(dev, ds)?;
         let params = (
             el,
             out_w,
@@ -813,7 +888,7 @@ impl Map1 for Pool2D {
         let func = dev.get_or_load_func(&kernel_name::<T>(kname), kernels::CONV)?;
         // SAFETY: Set later by running the kernel.
         let out = unsafe { dev.alloc::<T>(dst_el) }.w()?;
-        let ds = dev.htod_copy(ds).w()?;
+        let ds = SlicePtrOrNull::params_from_vec(dev, ds)?;
         let params = (
             el,
             self.w_k,
@@ -853,7 +928,7 @@ impl Map1 for UpsampleNearest2D {
         let func = dev.get_or_load_func(&kernel_name::<T>("upsample_nearest2d"), kernels::CONV)?;
         // SAFETY: Set later by running the kernel.
         let out = unsafe { dev.alloc::<T>(dst_el) }.w()?;
-        let ds = dev.htod_copy(ds).w()?;
+        let ds = SlicePtrOrNull::params_from_vec(dev, ds)?;
         let scale_w = dims[2] as f64 / out_w as f64;
         let scale_h = dims[3] as f64 / out_h as f64;
         let params = (out_w, out_h, scale_w, scale_h, &ds, inp, &out);
@@ -898,9 +973,10 @@ impl Map2 for WhereCond<'_> {
         let dims = shape.dims();
         let el = shape.elem_count();
         let cfg = LaunchConfig::for_num_elems(el as u32);
-        let ds = dev
-            .htod_copy([dims, ids_l.stride(), layout_t.stride(), layout_f.stride()].concat())
-            .w()?;
+        let ds = SlicePtrOrNull::params_from_vec(
+            dev,
+            [dims, ids_l.stride(), layout_t.stride(), layout_f.stride()].concat(),
+        )?;
         let t = &t.slice(layout_t.start_offset()..);
         let f = &f.slice(layout_f.start_offset()..);
         let func = dev.get_or_load_func(&kernel_name::<T>(name), kernels::TERNARY)?;
@@ -929,10 +1005,7 @@ impl<U: crate::op::BinaryOpT> Map2 for U {
         let dims_and_strides = if lhs_l.is_contiguous() && rhs_l.is_contiguous() {
             SlicePtrOrNull::Null
         } else {
-            SlicePtrOrNull::Ptr(
-                dev.htod_copy([dims, lhs_l.stride(), rhs_l.stride()].concat())
-                    .w()?,
-            )
+            SlicePtrOrNull::params_from_vec(dev, [dims, lhs_l.stride(), rhs_l.stride()].concat())?
         };
         let lhs = &lhs.slice(lhs_l.start_offset()..);
         let rhs = &rhs.slice(rhs_l.start_offset()..);
@@ -963,10 +1036,7 @@ impl Map2Any for Cmp {
         let dims_and_strides = if lhs_l.is_contiguous() && rhs_l.is_contiguous() {
             SlicePtrOrNull::Null
         } else {
-            SlicePtrOrNull::Ptr(
-                dev.htod_copy([dims, lhs_l.stride(), rhs_l.stride()].concat())
-                    .w()?,
-            )
+            SlicePtrOrNull::params_from_vec(dev, [dims, lhs_l.stride(), rhs_l.stride()].concat())?
         };
         let lhs = &lhs.slice(lhs_l.start_offset()..);
         let rhs = &rhs.slice(rhs_l.start_offset()..);
