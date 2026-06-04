@@ -41,6 +41,140 @@ use ubridge::prelude::{DevicePtr, DeviceSlice};
 use uhal::error::DeviceError;
 use uhal::memory::DevicePointerTrait;
 
+// ---------------------------------------------------------------------------
+// Kernel parameter cache for GCU graph capture.
+//
+// During graph capture every kernel launch uploads shape/stride metadata to
+// the device via htod_copy, creating a fresh allocation each time.  The graph
+// records the device pointer baked into the kernel launch; if a subsequent
+// capture (or the actual capture pass) allocates a *different* address for the
+// same metadata the replayed graph will read stale memory.
+//
+// The cache maps (device-id, params-vec) → Arc<GcuSlice<usize>> so that
+// identical metadata always resolves to the *same* device pointer.
+//
+// Usage:
+//   let _guard = cuda_param_cache_scope(true);
+//   // Phase 1 – CachePrewarm: forward pass populates the cache
+//   // Phase 2 – Warmup: forward pass (+ optional capture/discard) reuses cache
+//   // Phase 3 – Capture: graph capture sees stable pointers
+// ---------------------------------------------------------------------------
+#[cfg(feature = "graph")]
+use std::cell::Cell;
+#[cfg(feature = "graph")]
+use std::collections::HashMap;
+#[cfg(feature = "graph")]
+use std::sync::{Mutex, OnceLock};
+
+#[cfg(feature = "graph")]
+static GCU_PARAM_CACHE: OnceLock<Mutex<HashMap<(usize, Vec<usize>), Arc<GcuSlice<usize>>>>> =
+    OnceLock::new();
+
+#[cfg(feature = "graph")]
+thread_local! {
+    static GCU_PARAM_CACHE_ENABLED: Cell<bool> = const { Cell::new(false) };
+}
+
+pub struct GcuParamCacheGuard {
+    #[cfg(feature = "graph")]
+    previous: bool,
+}
+
+#[cfg(feature = "graph")]
+impl Drop for GcuParamCacheGuard {
+    fn drop(&mut self) {
+        GCU_PARAM_CACHE_ENABLED.with(|enabled| enabled.set(self.previous));
+    }
+}
+
+#[cfg(not(feature = "graph"))]
+impl Drop for GcuParamCacheGuard {
+    fn drop(&mut self) {}
+}
+
+pub fn cuda_param_cache_scope(enabled: bool) -> GcuParamCacheGuard {
+    #[cfg(feature = "graph")]
+    {
+        let previous = GCU_PARAM_CACHE_ENABLED.with(|cache_enabled| {
+            let previous = cache_enabled.get();
+            cache_enabled.set(enabled);
+            previous
+        });
+        GcuParamCacheGuard { previous }
+    }
+
+    #[cfg(not(feature = "graph"))]
+    {
+        let _ = enabled;
+        GcuParamCacheGuard {}
+    }
+}
+
+/// Check if the GCU parameter cache is currently enabled (thread-local).
+#[cfg(feature = "graph")]
+pub fn is_param_cache_enabled() -> bool {
+    GCU_PARAM_CACHE_ENABLED.with(|enabled| enabled.get())
+}
+
+/// Try to look up or insert a parameter vector in the cache.
+/// Returns `Some(arc_slice)` when caching is active and the lookup/insert succeeds.
+/// Returns `None` when caching is disabled or we are inside an active stream capture.
+#[cfg(feature = "graph")]
+pub fn param_cache_get_or_insert(
+    dev: &Arc<RawDevice>,
+    params: Vec<usize>,
+) -> std::result::Result<Option<Arc<GcuSlice<usize>>>, DeviceError> {
+    if !is_param_cache_enabled() {
+        return Ok(None);
+    }
+
+    let key = (dev.id, params.clone());
+    let cache = GCU_PARAM_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    if let Some(slice) = cache.lock().unwrap().get(&key).cloned() {
+        return Ok(Some(slice));
+    }
+
+    let is_capturing = cfg!(feature = "graph")
+        && RawDevice::capture_status(dev.stream_inner().expect("stream"))
+            == Ok(ubridge::gcu_slice::driv::topsStreamCaptureStatus::topsStreamCaptureStatusActive);
+
+    if !is_capturing {
+        let slice = Arc::new(dev.htod_copy(params)?);
+        let mut cache_lock = cache.lock().unwrap();
+        let slice = cache_lock.entry(key).or_insert_with(|| slice).clone();
+        return Ok(Some(slice));
+    }
+
+    Ok(None)
+}
+
+/// A device buffer holding kernel shape/stride parameters, either freshly
+/// allocated or retrieved from the global param cache.
+pub enum GcuParamSlice {
+    Owned(GcuSlice<usize>),
+    #[cfg(feature = "graph")]
+    Cached(Arc<GcuSlice<usize>>),
+}
+
+impl GcuParamSlice {
+    pub fn device_ptr(&self) -> ubridge::gcu_slice::driv::topsDeviceptr_t {
+        match self {
+            GcuParamSlice::Owned(s) => s.device_ptr(),
+            #[cfg(feature = "graph")]
+            GcuParamSlice::Cached(s) => s.device_ptr(),
+        }
+    }
+}
+
+unsafe impl DeviceCopy for &GcuParamSlice {
+    #[inline(always)]
+    fn as_kernel_param(&self) -> *mut std::ffi::c_void {
+        (&self.device_ptr()) as *const ubridge::gcu_slice::driv::topsDeviceptr_t
+            as *mut std::ffi::c_void
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum GcuStorageSlice {
     U8(GcuSlice<u8>),
@@ -167,6 +301,20 @@ impl GcuDevice {
 
     pub fn id(&self) -> usize {
         self.device.id
+    }
+
+    /// Upload a `Vec<usize>` to device memory, using the param cache when
+    /// enabled.  Returns the device pointer suitable for kernel parameters.
+    /// The returned enum keeps the allocation alive (either owned or cached).
+    pub fn htod_copy_cached(&self, params: Vec<usize>) -> Result<GcuParamSlice> {
+        #[cfg(feature = "graph")]
+        {
+            if let Some(cached) = param_cache_get_or_insert(&self.device, params.clone()).w()? {
+                return Ok(GcuParamSlice::Cached(cached));
+            }
+        }
+        let slice = self.device.htod_copy(params).w()?;
+        Ok(GcuParamSlice::Owned(slice))
     }
 
     fn const_impl(&self, v: f64, shape: &Shape, dtype: DType) -> Result<GcuStorage> {
@@ -849,7 +997,7 @@ impl Map1 for Elu {
         let shape = layout.shape();
         let dims = shape.dims();
         let el = shape.elem_count();
-        let ds = dev.htod_copy([dims, layout.stride()].concat())?;
+        let ds = dev.htod_copy_cached([dims, layout.stride()].concat())?;
         let src = &src.slice(layout.start_offset()..);
         let func = dev.get_or_load_func(&kernel_name::<T>("uelu"), ubridge::UNARY)?;
         let out = dev.alloc::<T>(el)?;
@@ -880,7 +1028,7 @@ impl Map1 for Powf {
         let dims = shape.dims();
         let el = shape.elem_count();
         let cfg = &dev.launch_cfg;
-        let ds = dev.htod_copy([dims, layout.stride()].concat()).w()?;
+        let ds = dev.htod_copy_cached([dims, layout.stride()].concat())?;
         let src = &src.slice(layout.start_offset()..);
         let func = dev.get_or_load_func(&kernel_name::<T>("upowf"), ubridge::UNARY)?;
         // SAFETY: Set later by running the kernel.
@@ -916,7 +1064,8 @@ impl<'a> Map1 for Sum<'a> {
             .iter()
             .map(|&d| src_dims[d + 1..].iter().product::<usize>())
             .collect();
-        let ds = dev.htod_copy([src_dims, layout.stride(), &sum_dims_l, &sum_dims_s].concat())?;
+        let ds =
+            dev.htod_copy_cached([src_dims, layout.stride(), &sum_dims_l, &sum_dims_s].concat())?;
         let src = &src.slice(layout.start_offset()..);
         let func = dev.get_or_load_func(&kernel_name::<T>("sum"), ubridge::REDUCE)?;
         let out = dev.alloc_zeros::<T>(dst_el).w()?;
@@ -1290,7 +1439,7 @@ impl<'a> Map2 for Conv1D<'a> {
         } else {
             crate::bail!("unexpected input shape for conv1d {dims:?}")
         };
-        let ds = dev.htod_copy(ds).w()?;
+        let ds = dev.htod_copy_cached(ds)?;
         let params = (
             el,
             l_out,
@@ -1336,7 +1485,7 @@ impl<'a> Map2 for Conv2D<'a> {
         } else {
             crate::bail!("unexpected input shape for conv2d {dims:?}")
         };
-        let ds = dev.htod_copy(ds).w()?;
+        let ds = dev.htod_copy_cached(ds)?;
         let params = (
             el,
             out_w,
@@ -1383,7 +1532,7 @@ impl<'a> Map2 for ConvTranspose2D<'a> {
         } else {
             crate::bail!("unexpected input shape for conv_transpose2d {dims:?}")
         };
-        let ds = dev.htod_copy(ds)?;
+        let ds = dev.htod_copy_cached(ds)?;
         let params = (
             el,
             out_w,
@@ -1442,7 +1591,7 @@ impl Map1 for Pool2D {
         let func = dev.get_or_load_func(&kernel_name::<T>(kname), ubridge::CONV)?;
         // SAFETY: Set later by running the kernel.
         let out = dev.alloc::<T>(dst_el).w()?;
-        let ds = dev.htod_copy(ds).w()?;
+        let ds = dev.htod_copy_cached(ds)?;
         let params = (
             el,
             self.w_k,
@@ -1481,7 +1630,7 @@ impl Map1 for UpsampleNearest2D {
         let func = dev.get_or_load_func(&kernel_name::<T>("upsample_nearest2d"), ubridge::CONV)?;
         // SAFETY: Set later by running the kernel.
         let out = dev.alloc::<T>(dst_el).w()?;
-        let ds = dev.htod_copy(ds).w()?;
+        let ds = dev.htod_copy_cached(ds)?;
         let scale_w = dims[2] as f64 / out_w as f64;
         let scale_h = dims[3] as f64 / out_h as f64;
         let params = (
@@ -1581,9 +1730,8 @@ impl<U: crate::op::BinaryOpT> Map2 for U {
         let lhs = &lhs.slice(lhs_l.start_offset()..);
         let rhs = &rhs.slice(rhs_l.start_offset()..);
         let out = dev.alloc::<T>(elem_count).w()?;
-        let dims_and_strides = dev
-            .htod_copy([dims, lhs_l.stride(), rhs_l.stride()].concat())
-            .w()?;
+        let dims_and_strides =
+            dev.htod_copy_cached([dims, lhs_l.stride(), rhs_l.stride()].concat())?;
         let func = dev.get_or_load_func(&kernel_name::<T>(U::KERNEL), ubridge::BINARY)?;
         let params = (
             elem_count,
@@ -1612,9 +1760,8 @@ impl Map2Any for Cmp {
         let shape = lhs_l.shape();
         let dims = shape.dims();
         let elem_count = shape.elem_count();
-        let dims_and_strides = dev
-            .htod_copy([dims, lhs_l.stride(), rhs_l.stride()].concat())
-            .w()?;
+        let dims_and_strides =
+            dev.htod_copy_cached([dims, lhs_l.stride(), rhs_l.stride()].concat())?;
         let lhs = &lhs.slice(lhs_l.start_offset()..);
         let rhs = &rhs.slice(rhs_l.start_offset()..);
         let name = match self.0 {
@@ -2287,6 +2434,91 @@ impl BackendStorage for GcuStorage {
             }
         }
 
+        #[cfg(feature = "aten")]
+        {
+            use ubridge::device_ptr::DevicePtr;
+            use ubridge::prelude::DeviceSlice;
+
+            let dtype_code: i32 = match (&self.slice, &rhs.slice) {
+                (GcuStorageSlice::F16(_), GcuStorageSlice::F16(_)) => 4,
+                (GcuStorageSlice::BF16(_), GcuStorageSlice::BF16(_)) => 5,
+                (GcuStorageSlice::F32(_), GcuStorageSlice::F32(_)) => 8,
+                _ => -1,
+            };
+
+            if dtype_code > 0 {
+                let stream = dev
+                    .stream_inner()
+                    .expect("unable to obtain stream for aten matmul");
+
+                macro_rules! aten_matmul {
+                    ($lhs_slice:expr, $rhs_slice:expr, $ty:ty, $variant:ident) => {{
+                        let lhs_s = &$lhs_slice.slice(lhs_l.start_offset()..);
+                        let rhs_s = &$rhs_slice.slice(rhs_l.start_offset()..);
+                        let out = dev.alloc::<$ty>(elem_count).w()?;
+
+                        let ret = if broadcasted_weight > 0 {
+                            unsafe {
+                                ubridge::ffi::topsaten_matmul_broadcast(
+                                    out.device_ptr() as *mut std::ffi::c_void,
+                                    lhs_s.device_ptr() as *const std::ffi::c_void,
+                                    rhs_s.device_ptr() as *const std::ffi::c_void,
+                                    b as i32,
+                                    m as i32,
+                                    k as i32,
+                                    n as i32,
+                                    lhs_transpose,
+                                    rhs_transpose,
+                                    dtype_code,
+                                    stream as *const std::ffi::c_void,
+                                )
+                            }
+                        } else {
+                            unsafe {
+                                ubridge::ffi::topsaten_matmul(
+                                    out.device_ptr() as *mut std::ffi::c_void,
+                                    lhs_s.device_ptr() as *const std::ffi::c_void,
+                                    rhs_s.device_ptr() as *const std::ffi::c_void,
+                                    b as i32,
+                                    m as i32,
+                                    k as i32,
+                                    n as i32,
+                                    lhs_transpose,
+                                    rhs_transpose,
+                                    dtype_code,
+                                    stream as *const std::ffi::c_void,
+                                )
+                            }
+                        };
+                        if ret != 0 {
+                            crate::bail!(
+                                "topsaten_matmul failed with code {ret} (b={b}, m={m}, k={k}, n={n}, \
+                                 lhs_t={lhs_transpose}, rhs_t={rhs_transpose}, bcast={broadcasted_weight})"
+                            );
+                        }
+                        GcuStorageSlice::$variant(out)
+                    }};
+                }
+
+                let slice = match (&self.slice, &rhs.slice) {
+                    (GcuStorageSlice::F16(lhs), GcuStorageSlice::F16(rhs_s)) => {
+                        aten_matmul!(lhs, rhs_s, half::f16, F16)
+                    }
+                    (GcuStorageSlice::BF16(lhs), GcuStorageSlice::BF16(rhs_s)) => {
+                        aten_matmul!(lhs, rhs_s, half::bf16, BF16)
+                    }
+                    (GcuStorageSlice::F32(lhs), GcuStorageSlice::F32(rhs_s)) => {
+                        aten_matmul!(lhs, rhs_s, f32, F32)
+                    }
+                    _ => unreachable!(),
+                };
+                return Ok(Self {
+                    slice,
+                    device: dev.clone(),
+                });
+            }
+        }
+
         let slice = match (&self.slice, &rhs.slice) {
             (GcuStorageSlice::BF16(lhs), GcuStorageSlice::BF16(rhs)) => {
                 let lhs = &lhs.slice(lhs_l.start_offset()..);
@@ -2538,8 +2770,7 @@ impl BackendStorage for GcuStorage {
         }
         //dst shape, dst stride, dst layout, origin shape
         let ds = dev
-            .htod_copy([dims, src_l.stride(), &dst_layout, origin_shape.dims()].concat())
-            .w()?;
+            .htod_copy_cached([dims, src_l.stride(), &dst_layout, origin_shape.dims()].concat())?;
         let mut cfg = dev.launch_cfg.clone();
 
         if (op_type == 1 && origin_el_count == el_count && dims.len() < 5)
@@ -2909,9 +3140,8 @@ impl crate::CustomOp2 for KVConcat {
         let cfg = &dev.launch_cfg;
         let elem_count = ltensor_l.shape().elem_count() + rtensor_l.shape().elem_count();
         let dims = ltensor_l.shape().dims().len();
-        let ds = dev
-            .htod_copy([ltensor_l.shape().dims(), rtensor_l.shape().dims()].concat())
-            .w()?;
+        let ds =
+            dev.htod_copy_cached([ltensor_l.shape().dims(), rtensor_l.shape().dims()].concat())?;
         let slice = match (&ltensor.slice, &rtensor.slice) {
             (GcuStorageSlice::BF16(left_), GcuStorageSlice::BF16(right_)) => {
                 let out = dev.alloc::<bf16>(elem_count).w()?;
@@ -3202,6 +3432,129 @@ impl crate::CustomOp1 for Activation {
 
         let device = dev.clone();
         Ok((GcuStorage { slice, device }, l.shape().into()))
+    }
+}
+
+/// Fused activation+multiply: out = act(x[..., :D]) * x[..., D:]
+/// Input shape [N, 2*D], output shape [N, D].
+pub enum FusedActAndMul {
+    SiluAndMul,
+    GeluAndMul,
+    GeluTanhAndMul,
+}
+
+impl crate::CustomOp1 for FusedActAndMul {
+    fn name(&self) -> &'static str {
+        match self {
+            FusedActAndMul::SiluAndMul => "silu_and_mul",
+            FusedActAndMul::GeluAndMul => "gelu_and_mul",
+            FusedActAndMul::GeluTanhAndMul => "gelu_tanh_and_mul",
+        }
+    }
+
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout) -> Result<(CpuStorage, Shape)> {
+        crate::bail!("no cpu support for fused act-and-mul")
+    }
+
+    fn gcu_fwd(&self, s: &GcuStorage, l: &Layout) -> Result<(GcuStorage, Shape)> {
+        let dev = &s.device;
+        let dims = l.shape().dims();
+        if dims.len() < 2 {
+            crate::bail!("fused act-and-mul requires at least 2D input");
+        }
+        let last = dims[dims.len() - 1];
+        if last % 2 != 0 {
+            crate::bail!("fused act-and-mul: last dim must be even, got {last}");
+        }
+        let d = last / 2;
+        let num_tokens: i32 = dims[..dims.len() - 1].iter().product::<usize>() as i32;
+
+        #[cfg(feature = "aten")]
+        {
+            use ubridge::device_ptr::DevicePtr;
+            use ubridge::prelude::DeviceSlice;
+
+            let (dtype_code, ffi_fn): (
+                i32,
+                unsafe extern "C" fn(
+                    *mut std::ffi::c_void,
+                    *const std::ffi::c_void,
+                    i32,
+                    i32,
+                    i32,
+                    *const std::ffi::c_void,
+                ) -> i32,
+            ) = match self {
+                FusedActAndMul::SiluAndMul => match &s.slice {
+                    GcuStorageSlice::BF16(_) => (5, ubridge::ffi::topsaten_silu_and_mul),
+                    GcuStorageSlice::F16(_) => (4, ubridge::ffi::topsaten_silu_and_mul),
+                    GcuStorageSlice::F32(_) => (8, ubridge::ffi::topsaten_silu_and_mul),
+                    _ => (-1, ubridge::ffi::topsaten_silu_and_mul),
+                },
+                FusedActAndMul::GeluAndMul => match &s.slice {
+                    GcuStorageSlice::BF16(_) => (5, ubridge::ffi::topsaten_gelu_and_mul),
+                    GcuStorageSlice::F16(_) => (4, ubridge::ffi::topsaten_gelu_and_mul),
+                    GcuStorageSlice::F32(_) => (8, ubridge::ffi::topsaten_gelu_and_mul),
+                    _ => (-1, ubridge::ffi::topsaten_gelu_and_mul),
+                },
+                FusedActAndMul::GeluTanhAndMul => match &s.slice {
+                    GcuStorageSlice::BF16(_) => (5, ubridge::ffi::topsaten_gelu_tanh_and_mul),
+                    GcuStorageSlice::F16(_) => (4, ubridge::ffi::topsaten_gelu_tanh_and_mul),
+                    GcuStorageSlice::F32(_) => (8, ubridge::ffi::topsaten_gelu_tanh_and_mul),
+                    _ => (-1, ubridge::ffi::topsaten_gelu_tanh_and_mul),
+                },
+            };
+
+            if dtype_code > 0 {
+                let stream = dev
+                    .stream_inner()
+                    .expect("unable to obtain stream for fused act-and-mul");
+
+                macro_rules! fused_act_mul {
+                    ($slice:expr, $ty:ty, $variant:ident) => {{
+                        let inp = &$slice.slice(l.start_offset()..);
+                        let out = dev.alloc::<$ty>(num_tokens as usize * d).w()?;
+                        let ret = unsafe {
+                            ffi_fn(
+                                out.device_ptr() as *mut std::ffi::c_void,
+                                inp.device_ptr() as *const std::ffi::c_void,
+                                num_tokens,
+                                d as i32,
+                                dtype_code,
+                                stream as *const std::ffi::c_void,
+                            )
+                        };
+                        if ret != 0 {
+                            crate::bail!(
+                                "{} failed with code {ret} (tokens={num_tokens}, d={d})",
+                                self.name()
+                            );
+                        }
+                        GcuStorageSlice::$variant(out)
+                    }};
+                }
+
+                let slice = match &s.slice {
+                    GcuStorageSlice::BF16(inp) => fused_act_mul!(inp, half::bf16, BF16),
+                    GcuStorageSlice::F16(inp) => fused_act_mul!(inp, half::f16, F16),
+                    GcuStorageSlice::F32(inp) => fused_act_mul!(inp, f32, F32),
+                    _ => crate::bail!("unsupported dtype for fused act-and-mul"),
+                };
+
+                let mut out_dims = dims.to_vec();
+                out_dims[dims.len() - 1] = d;
+                return Ok((
+                    GcuStorage {
+                        slice,
+                        device: dev.clone(),
+                    },
+                    out_dims.into(),
+                ));
+            }
+        }
+
+        // Fallback: chunk + activation + multiply (generic path)
+        crate::bail!("fused act-and-mul requires the aten feature on GCU")
     }
 }
 

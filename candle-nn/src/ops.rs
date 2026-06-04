@@ -45,8 +45,85 @@ pub fn silu(xs: &Tensor) -> Result<Tensor> {
 }
 
 pub fn swiglu(xs: &Tensor) -> Result<Tensor> {
+    silu_and_mul(xs)
+}
+
+/// Fused silu(x[..., :D]) * x[..., D:] — uses TopsAten on GCU with aten feature.
+#[cfg(feature = "gcu")]
+pub fn silu_and_mul(xs: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "aten")]
+    {
+        let op = candle::gcu_backend::FusedActAndMul::SiluAndMul;
+        let xs = if xs.is_contiguous() {
+            xs.clone()
+        } else {
+            xs.contiguous()?
+        };
+        return xs.apply_op1(op);
+    }
+    #[cfg(not(feature = "aten"))]
+    {
+        let xs = xs.chunk(2, D::Minus1)?;
+        &xs[0].silu()? * &xs[1]
+    }
+}
+
+#[cfg(not(feature = "gcu"))]
+pub fn silu_and_mul(xs: &Tensor) -> Result<Tensor> {
     let xs = xs.chunk(2, D::Minus1)?;
     &xs[0].silu()? * &xs[1]
+}
+
+/// Fused gelu(x[..., :D]) * x[..., D:]
+#[cfg(feature = "gcu")]
+pub fn gelu_and_mul(xs: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "aten")]
+    {
+        let op = candle::gcu_backend::FusedActAndMul::GeluAndMul;
+        let xs = if xs.is_contiguous() {
+            xs.clone()
+        } else {
+            xs.contiguous()?
+        };
+        return xs.apply_op1(op);
+    }
+    #[cfg(not(feature = "aten"))]
+    {
+        let xs = xs.chunk(2, D::Minus1)?;
+        &xs[0].gelu()? * &xs[1]
+    }
+}
+
+#[cfg(not(feature = "gcu"))]
+pub fn gelu_and_mul(xs: &Tensor) -> Result<Tensor> {
+    let xs = xs.chunk(2, D::Minus1)?;
+    &xs[0].gelu()? * &xs[1]
+}
+
+/// Fused gelu_tanh(x[..., :D]) * x[..., D:]
+#[cfg(feature = "gcu")]
+pub fn gelu_tanh_and_mul(xs: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "aten")]
+    {
+        let op = candle::gcu_backend::FusedActAndMul::GeluTanhAndMul;
+        let xs = if xs.is_contiguous() {
+            xs.clone()
+        } else {
+            xs.contiguous()?
+        };
+        return xs.apply_op1(op);
+    }
+    #[cfg(not(feature = "aten"))]
+    {
+        let xs = xs.chunk(2, D::Minus1)?;
+        &xs[0].gelu()? * &xs[1]
+    }
+}
+
+#[cfg(not(feature = "gcu"))]
+pub fn gelu_tanh_and_mul(xs: &Tensor) -> Result<Tensor> {
+    let xs = xs.chunk(2, D::Minus1)?;
+    &xs[0].gelu()? * &xs[1]
 }
 
 #[cfg(not(feature = "gcu"))]
@@ -460,6 +537,73 @@ impl candle::CustomOp1 for SoftmaxLastDim {
         use candle::{backend::BackendStorage, gcu_backend::DeviceCopy};
         use candle::{GcuDevice, WithDType};
 
+        #[cfg(feature = "aten")]
+        {
+            use candle::gcu_backend::GcuStorageSlice;
+
+            let dev = storage.device();
+            let el = layout.shape().elem_count();
+            let dims = layout.shape().dims();
+            let dim_m1 = dims[dims.len() - 1];
+            let n_rows = (el / dim_m1) as i32;
+            let n_cols = dim_m1 as i32;
+
+            let dtype_code: i32 = match &storage.slice {
+                GcuStorageSlice::BF16(_) => 5,
+                GcuStorageSlice::F16(_) => 4,
+                GcuStorageSlice::F32(_) => 8,
+                _ => -1,
+            };
+
+            if dtype_code > 0 {
+                let stream = dev
+                    .stream_inner()
+                    .expect("unable to obtain stream for aten softmax");
+
+                macro_rules! aten_softmax {
+                    ($src_slice:expr, $ty:ty, $variant:ident) => {{
+                        let src = match layout.contiguous_offsets() {
+                            None => candle::bail!("input has to be contiguous"),
+                            Some((o1, o2)) => $src_slice.slice(o1..o2),
+                        };
+                        let dst = dev.alloc::<$ty>(el).w()?;
+                        let ret = unsafe {
+                            ubridge::ffi::topsaten_softmax(
+                                dst.device_ptr() as *mut std::ffi::c_void,
+                                src.device_ptr() as *const std::ffi::c_void,
+                                n_rows,
+                                n_cols,
+                                dtype_code,
+                                stream as *const std::ffi::c_void,
+                            )
+                        };
+                        if ret != 0 {
+                            candle::bail!(
+                                "topsaten_softmax failed with code {ret} (rows={n_rows}, cols={n_cols})"
+                            );
+                        }
+                        GcuStorageSlice::$variant(dst)
+                    }};
+                }
+
+                let slice = match &storage.slice {
+                    GcuStorageSlice::BF16(s) => aten_softmax!(s, half::bf16, BF16),
+                    GcuStorageSlice::F16(s) => aten_softmax!(s, half::f16, F16),
+                    GcuStorageSlice::F32(s) => aten_softmax!(s, f32, F32),
+                    _ => unreachable!(),
+                };
+
+                return Ok((
+                    candle::gcu_backend::GcuStorage {
+                        slice,
+                        device: dev.clone(),
+                    },
+                    layout.shape().clone(),
+                ));
+            }
+        }
+
+        // Fallback: ubridge reduce.cpp softmax kernel
         struct S;
         impl Map1 for S {
             fn f<T: DeviceCopy + WithDType>(
@@ -673,7 +817,6 @@ impl candle::CustomOp2 for RmsNorm {
         use half::{bf16, f16};
 
         let dev = &s1.device;
-        let cfg = &dev.launch_cfg;
         let elem_count = l1.shape().elem_count();
         let dims = l1.shape().dims();
         let dim_m1 = dims[dims.len() - 1];
@@ -683,42 +826,94 @@ impl candle::CustomOp2 for RmsNorm {
             (dims[0], elem_count / dims[0] / dim_m1, dim_m1)
         };
 
-        macro_rules! rmsnorm_gcu {
-            ($x:expr, $w:expr, $ty:ty, $variant:ident, $kname:expr) => {{
-                let out = dev.alloc::<$ty>(elem_count).w()?;
-                let func = dev.get_or_load_func($kname, ubridge::REDUCE)?;
-                let params = (
-                    $x.device_ptr(),
-                    out.device_ptr(),
-                    $w.device_ptr(),
-                    $w.device_ptr(),
-                    batch as i32,
-                    chunks as i32,
-                    last_dim_size as i32,
-                    self.eps,
-                    0i32,
-                    0i32,
-                );
-                unsafe { func.launch(cfg, params) }.w()?;
-                GcuStorageSlice::$variant(out)
-            }};
+        #[cfg(feature = "aten")]
+        {
+            let num_tokens = (batch * chunks) as i32;
+            let hidden_size = last_dim_size as i32;
+            let stream = dev
+                .stream_inner()
+                .expect("unable to obtain stream for aten rmsnorm");
+
+            macro_rules! aten_rmsnorm {
+                ($x:expr, $w:expr, $ty:ty, $variant:ident, $dtype_code:expr) => {{
+                    let out = dev.alloc::<$ty>(elem_count).w()?;
+                    let ret = unsafe {
+                        ubridge::ffi::topsaten_rms_norm(
+                            out.device_ptr() as *mut std::ffi::c_void,
+                            $x.device_ptr() as *const std::ffi::c_void,
+                            $w.device_ptr() as *const std::ffi::c_void,
+                            num_tokens,
+                            hidden_size,
+                            self.eps,
+                            $dtype_code,
+                            stream as *const std::ffi::c_void,
+                        )
+                    };
+                    if ret != 0 {
+                        candle::bail!("topsaten_rms_norm failed with code {ret}");
+                    }
+                    GcuStorageSlice::$variant(out)
+                }};
+            }
+
+            let slice = match (&s1.slice, &s2.slice) {
+                (GcuStorageSlice::BF16(x), GcuStorageSlice::BF16(w)) => {
+                    aten_rmsnorm!(x, w, bf16, BF16, 5i32)
+                }
+                (GcuStorageSlice::F16(x), GcuStorageSlice::F16(w)) => {
+                    aten_rmsnorm!(x, w, f16, F16, 4i32)
+                }
+                (GcuStorageSlice::F32(x), GcuStorageSlice::F32(w)) => {
+                    aten_rmsnorm!(x, w, f32, F32, 8i32)
+                }
+                _ => candle::bail!("unsupported dtype for rmsnorm on gcu"),
+            };
+
+            let device = dev.clone();
+            return Ok((candle::GcuStorage { slice, device }, l1.shape().clone()));
         }
 
-        let slice = match (&s1.slice, &s2.slice) {
-            (GcuStorageSlice::BF16(x), GcuStorageSlice::BF16(w)) => {
-                rmsnorm_gcu!(x, w, bf16, BF16, "layernorm_bf16")
-            }
-            (GcuStorageSlice::F16(x), GcuStorageSlice::F16(w)) => {
-                rmsnorm_gcu!(x, w, f16, F16, "layernorm_f16")
-            }
-            (GcuStorageSlice::F32(x), GcuStorageSlice::F32(w)) => {
-                rmsnorm_gcu!(x, w, f32, F32, "layernorm_f32")
-            }
-            _ => candle::bail!("unsupported dtype for rmsnorm on gcu"),
-        };
+        #[cfg(not(feature = "aten"))]
+        {
+            let cfg = &dev.launch_cfg;
 
-        let device = dev.clone();
-        Ok((candle::GcuStorage { slice, device }, l1.shape().clone()))
+            macro_rules! rmsnorm_gcu {
+                ($x:expr, $w:expr, $ty:ty, $variant:ident, $kname:expr) => {{
+                    let out = dev.alloc::<$ty>(elem_count).w()?;
+                    let func = dev.get_or_load_func($kname, ubridge::REDUCE)?;
+                    let params = (
+                        $x.device_ptr(),
+                        out.device_ptr(),
+                        $w.device_ptr(),
+                        $w.device_ptr(),
+                        batch as i32,
+                        chunks as i32,
+                        last_dim_size as i32,
+                        self.eps,
+                        0i32,
+                        0i32,
+                    );
+                    unsafe { func.launch(cfg, params) }.w()?;
+                    GcuStorageSlice::$variant(out)
+                }};
+            }
+
+            let slice = match (&s1.slice, &s2.slice) {
+                (GcuStorageSlice::BF16(x), GcuStorageSlice::BF16(w)) => {
+                    rmsnorm_gcu!(x, w, bf16, BF16, "layernorm_bf16")
+                }
+                (GcuStorageSlice::F16(x), GcuStorageSlice::F16(w)) => {
+                    rmsnorm_gcu!(x, w, f16, F16, "layernorm_f16")
+                }
+                (GcuStorageSlice::F32(x), GcuStorageSlice::F32(w)) => {
+                    rmsnorm_gcu!(x, w, f32, F32, "layernorm_f32")
+                }
+                _ => candle::bail!("unsupported dtype for rmsnorm on gcu"),
+            };
+
+            let device = dev.clone();
+            Ok((candle::GcuStorage { slice, device }, l1.shape().clone()))
+        }
     }
 
     #[cfg(feature = "metal")]
@@ -1579,34 +1774,27 @@ pub fn apply_rotary_emb_qkv(
     query_key_transposed: bool,
     gpt_neox: bool,
 ) -> Result<(Tensor, Tensor)> {
-    let index_positions: Vec<i32> = if index_positions.dtype() == candle::DType::I64 {
-        index_positions
-            .to_vec1::<i64>()?
-            .iter()
-            .map(|&v| v as i32)
-            .collect()
-    } else {
-        index_positions.to_vec1()?
-    };
-    let index_positions = &index_positions;
-    pub fn fused_rope(
+    fn fused_rope(
         query: &Tensor,
         key: &Tensor,
         cos_sin: &Tensor,
         cos_sin_length: i32,
         cos_sin_stride: i32,
-        index_positions: &Vec<i32>,
+        index_positions: &Tensor,
         batch: i32,
         num_tokens: i32,
         q_head_size: i32,
         k_head_size: i32,
         hidden_size: i32,
-        split_dim: i32, //used for partial rope
+        split_dim: i32,
         gpt_neox: i32,
     ) -> Result<Tensor> {
         use candle::gcu_backend::Rope;
-        let idx_i64: Vec<i64> = index_positions.iter().map(|&v| v as i64).collect();
-        let idx_tensor = Tensor::new(idx_i64.as_slice(), query.device())?;
+        let idx_tensor = if index_positions.dtype() == candle::DType::I64 {
+            index_positions.clone()
+        } else {
+            index_positions.to_dtype(candle::DType::I64)?
+        };
         let op = Rope {
             cos_sin_length,
             cos_sin_stride,
@@ -2161,14 +2349,13 @@ fn topk_func<
     k: usize,
 ) -> Result<(Tensor, Tensor)> {
     use candle::gcu_backend::ubridge::device_ptr::DevicePtr;
-    use candle::gcu_backend::ubridge::ffi::{topk_bf16, topk_f16, topk_f32};
     use candle::gcu_backend::WrapErr;
     use candle::Storage;
     use half::{bf16, f16};
+
     let dev = input.device().as_gcu_device()?;
     let (value, input_l) = input.storage_and_layout();
     let shape = input_l.shape();
-    let el_count = shape.elem_count();
     let stream = dev.stream_inner().unwrap();
     let value = match &*value {
         Storage::Gcu(k) => k,
@@ -2177,71 +2364,77 @@ fn topk_func<
 
     let rank = input_l.dims().len();
     assert!(rank <= 3);
-    let value = value.as_gcu_slice::<T>()?;
-    let value = value.slice(input_l.start_offset()..);
-    let (chunks, dims) = if rank == 3 {
-        (shape.dims()[0] * shape.dims()[1], shape.dims().to_vec())
-    } else if rank == 2 {
-        (
-            shape.dims()[0],
-            [1usize, shape.dims()[0], shape.dims()[1]].to_vec(),
-        )
-    } else {
-        (1usize, [1usize, 1usize, shape.dims()[0]].to_vec())
-    };
 
-    let indices = dev.alloc::<u32>(chunks * k).w()?;
-    let out = dev.alloc::<T>(chunks * k).w()?;
-    match input.dtype() {
-        DType::F16 => unsafe {
-            topk_f16(
-                value.device_ptr() as *mut f16,
-                out.device_ptr() as *mut f16,
-                indices.device_ptr() as *mut u32,
-                dims[0] as i32,
-                dims[1] as i32,
-                dims[2] as i32,
-                k as i32,
-                stream as *mut core::ffi::c_void,
-            );
-        },
-        DType::BF16 => unsafe {
-            topk_bf16(
-                value.device_ptr() as *mut bf16,
-                out.device_ptr() as *mut bf16,
-                indices.device_ptr() as *mut u32,
-                dims[0] as i32,
-                dims[1] as i32,
-                dims[2] as i32,
-                k as i32,
-                stream as *mut core::ffi::c_void,
-            );
-        },
-        DType::F32 => unsafe {
-            topk_f32(
-                value.device_ptr() as *mut f32,
-                out.device_ptr() as *mut f32,
-                indices.device_ptr() as *mut u32,
-                dims[0] as i32,
-                dims[1] as i32,
-                dims[2] as i32,
-                k as i32,
-                stream as *mut core::ffi::c_void,
-            );
-        },
-        _ => {
-            panic!("not supported data type!")
+    {
+        use candle::gcu_backend::ubridge::ffi::{topk_bf16, topk_f16, topk_f32};
+
+        let value = value.as_gcu_slice::<T>()?;
+        let value = value.slice(input_l.start_offset()..);
+        let el_count = shape.elem_count();
+        let (chunks, dims) = if rank == 3 {
+            (shape.dims()[0] * shape.dims()[1], shape.dims().to_vec())
+        } else if rank == 2 {
+            (
+                shape.dims()[0],
+                [1usize, shape.dims()[0], shape.dims()[1]].to_vec(),
+            )
+        } else {
+            (1usize, [1usize, 1usize, shape.dims()[0]].to_vec())
+        };
+
+        let indices = dev.alloc::<u32>(chunks * k).w()?;
+        let out = dev.alloc::<T>(chunks * k).w()?;
+        match input.dtype() {
+            DType::F16 => unsafe {
+                topk_f16(
+                    value.device_ptr() as *mut f16,
+                    out.device_ptr() as *mut f16,
+                    indices.device_ptr() as *mut u32,
+                    dims[0] as i32,
+                    dims[1] as i32,
+                    dims[2] as i32,
+                    k as i32,
+                    stream as *mut core::ffi::c_void,
+                );
+            },
+            DType::BF16 => unsafe {
+                topk_bf16(
+                    value.device_ptr() as *mut bf16,
+                    out.device_ptr() as *mut bf16,
+                    indices.device_ptr() as *mut u32,
+                    dims[0] as i32,
+                    dims[1] as i32,
+                    dims[2] as i32,
+                    k as i32,
+                    stream as *mut core::ffi::c_void,
+                );
+            },
+            DType::F32 => unsafe {
+                topk_f32(
+                    value.device_ptr() as *mut f32,
+                    out.device_ptr() as *mut f32,
+                    indices.device_ptr() as *mut u32,
+                    dims[0] as i32,
+                    dims[1] as i32,
+                    dims[2] as i32,
+                    k as i32,
+                    stream as *mut core::ffi::c_void,
+                );
+            },
+            _ => {
+                panic!("not supported data type!")
+            }
         }
+        let s_out = candle::GcuStorage::wrap_gcu_slice(out, dev.clone());
+        let s_indices = candle::GcuStorage::wrap_gcu_slice(indices, dev.clone());
+        let mut out_dims = shape.dims().to_vec();
+        let last_dim = out_dims.len() - 1;
+        out_dims[last_dim] = k;
+        return Ok((
+            Tensor::from_storage(candle::Storage::Gcu(s_out), out_dims.clone())?,
+            Tensor::from_storage(candle::Storage::Gcu(s_indices), out_dims.clone())?,
+        ));
     }
-    let s_out = candle::GcuStorage::wrap_gcu_slice(out, dev.clone());
-    let s_indices = candle::GcuStorage::wrap_gcu_slice(indices, dev.clone());
-    let mut out_dims = shape.dims().to_vec();
-    let last_dim = out_dims.len() - 1;
-    out_dims[last_dim] = k;
-    Ok((
-        Tensor::from_storage(candle::Storage::Gcu(s_out), out_dims.clone())?,
-        Tensor::from_storage(candle::Storage::Gcu(s_indices), out_dims.clone())?,
-    ))
 }
 
 #[cfg(feature = "gcu")]

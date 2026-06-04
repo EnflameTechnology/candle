@@ -123,7 +123,7 @@ pub use cuda::{CudaDevice, CudaStorage};
 pub use dummy_gcu_backend::{GcuDevice, GcuStorage};
 
 #[cfg(feature = "gcu")]
-pub use gcu_backend::{GcuDevice, GcuStorage};
+pub use gcu_backend::{cuda_param_cache_scope, GcuDevice, GcuStorage};
 
 #[cfg(feature = "metal")]
 pub use metal_backend::{MetalDevice, MetalError, MetalStorage};

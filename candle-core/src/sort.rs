@@ -211,56 +211,124 @@ impl crate::CustomOp1 for ArgSort {
         layout: &crate::Layout,
     ) -> Result<(crate::GcuStorage, crate::Shape)> {
         use crate::gcu_backend::ubridge::device_ptr::DevicePtr;
-        use crate::gcu_backend::ubridge::gcu_launch::{GcuLaunchAsync, GcuLaunchConfig};
         use crate::gcu_backend::{GcuStorageSlice, WrapErr};
 
         let dev = storage.device();
         let elem_count = layout.shape().elem_count();
         let ncols = self.last_dim as i32;
         let nrows = (elem_count as i32 / ncols) as i32;
-        let dst = dev.alloc::<u32>(elem_count).w()?;
 
-        let (src_ptr, dtype_str) = match &storage.slice {
-            GcuStorageSlice::U8(inp) => (inp.device_ptr(), "u8"),
-            GcuStorageSlice::I8(inp) => (inp.device_ptr(), "i8"),
-            GcuStorageSlice::U32(inp) => (inp.device_ptr(), "u32"),
-            GcuStorageSlice::I32(inp) => (inp.device_ptr(), "i32"),
-            GcuStorageSlice::I64(inp) => (inp.device_ptr(), "i64"),
-            GcuStorageSlice::BF16(inp) => (inp.device_ptr(), "bf16"),
-            GcuStorageSlice::F16(inp) => (inp.device_ptr(), "f16"),
-            GcuStorageSlice::F32(inp) => (inp.device_ptr(), "f32"),
-            GcuStorageSlice::F64(inp) => (inp.device_ptr(), "f64"),
-        };
-        let dst_ptr = dst.device_ptr();
+        #[cfg(feature = "aten")]
+        {
+            use crate::gcu_backend::ubridge::ffi::topsaten_sort;
+            use crate::gcu_backend::ubridge::prelude::DeviceSlice;
 
-        let func = if self.asc {
-            dev.get_or_load_func(&format!("asort_asc_{}", dtype_str), ubridge::SORT)?
-        } else {
-            dev.get_or_load_func(&format!("asort_desc_{}", dtype_str), ubridge::SORT)?
-        };
-        let ncols_pad = next_power_of_2(ncols as usize);
-        let params = (
-            src_ptr,
-            dst_ptr,
-            nrows,
-            ncols,
-            ncols_pad as i32,
-            self.inplace,
-        );
-        let cfg = GcuLaunchConfig {
-            grid_dim: (1, 1, 1),
-            block_dim: (12, 1, 1),
-            shared_mem_bytes: (3 * ncols_pad * std::mem::size_of::<u32>()) as u32,
-            is_cooperative_launch: false,
-        };
+            let dtype_code: i32 = match &storage.slice {
+                GcuStorageSlice::BF16(_) => 5,
+                GcuStorageSlice::F16(_) => 4,
+                GcuStorageSlice::F32(_) => 8,
+                _ => -1,
+            };
 
-        unsafe { func.launch(&cfg, params) }.w()?;
+            if dtype_code > 0 {
+                let stream = dev
+                    .stream_inner()
+                    .expect("unable to obtain stream for aten sort");
 
-        let dst_ret = crate::gcu_backend::GcuStorage {
-            slice: GcuStorageSlice::U32(dst),
-            device: dev.clone(),
-        };
-        Ok((dst_ret, layout.shape().clone()))
+                macro_rules! aten_sort {
+                    ($inp:expr, $ty:ty, $variant:ident) => {{
+                        let inp_s = &$inp.slice(layout.start_offset()..);
+                        let sorted = dev.alloc::<$ty>(elem_count).w()?;
+                        let indices = dev.alloc::<i64>(elem_count).w()?;
+
+                        let ret = unsafe {
+                            topsaten_sort(
+                                sorted.device_ptr() as *mut std::ffi::c_void,
+                                indices.device_ptr() as *mut std::ffi::c_void,
+                                inp_s.device_ptr() as *const std::ffi::c_void,
+                                nrows,
+                                ncols,
+                                if self.asc { 0 } else { 1 },
+                                dtype_code,
+                                stream as *const std::ffi::c_void,
+                            )
+                        };
+                        if ret != 0 {
+                            crate::bail!(
+                                "topsaten_sort failed with code {ret} (rows={nrows}, cols={ncols})"
+                            );
+                        }
+                        // Return indices as I64 (caller handles dtype conversion)
+                        GcuStorageSlice::I64(indices)
+                    }};
+                }
+
+                let indices_i64_slice = match &storage.slice {
+                    GcuStorageSlice::BF16(s) => aten_sort!(s, half::bf16, BF16),
+                    GcuStorageSlice::F16(s) => aten_sort!(s, half::f16, F16),
+                    GcuStorageSlice::F32(s) => aten_sort!(s, f32, F32),
+                    _ => unreachable!(),
+                };
+
+                // Convert I64 indices to U32 via cast kernel
+                let i64_storage = crate::gcu_backend::GcuStorage {
+                    slice: indices_i64_slice,
+                    device: dev.clone(),
+                };
+                let contig_layout = crate::Layout::contiguous(layout.shape());
+                let u32_storage = i64_storage.to_dtype(&contig_layout, crate::DType::U32)?;
+                return Ok((u32_storage, layout.shape().clone()));
+            }
+        }
+
+        // Fallback: ubridge sort kernel
+        {
+            use crate::gcu_backend::ubridge::gcu_launch::{GcuLaunchAsync, GcuLaunchConfig};
+
+            let dst = dev.alloc::<u32>(elem_count).w()?;
+
+            let (src_ptr, dtype_str) = match &storage.slice {
+                GcuStorageSlice::U8(inp) => (inp.device_ptr(), "u8"),
+                GcuStorageSlice::I8(inp) => (inp.device_ptr(), "i8"),
+                GcuStorageSlice::U32(inp) => (inp.device_ptr(), "u32"),
+                GcuStorageSlice::I32(inp) => (inp.device_ptr(), "i32"),
+                GcuStorageSlice::I64(inp) => (inp.device_ptr(), "i64"),
+                GcuStorageSlice::BF16(inp) => (inp.device_ptr(), "bf16"),
+                GcuStorageSlice::F16(inp) => (inp.device_ptr(), "f16"),
+                GcuStorageSlice::F32(inp) => (inp.device_ptr(), "f32"),
+                GcuStorageSlice::F64(inp) => (inp.device_ptr(), "f64"),
+            };
+            let dst_ptr = dst.device_ptr();
+
+            let func = if self.asc {
+                dev.get_or_load_func(&format!("asort_asc_{}", dtype_str), ubridge::SORT)?
+            } else {
+                dev.get_or_load_func(&format!("asort_desc_{}", dtype_str), ubridge::SORT)?
+            };
+            let ncols_pad = next_power_of_2(ncols as usize);
+            let params = (
+                src_ptr,
+                dst_ptr,
+                nrows,
+                ncols,
+                ncols_pad as i32,
+                self.inplace,
+            );
+            let cfg = GcuLaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (12, 1, 1),
+                shared_mem_bytes: (3 * ncols_pad * std::mem::size_of::<u32>()) as u32,
+                is_cooperative_launch: false,
+            };
+
+            unsafe { func.launch(&cfg, params) }.w()?;
+
+            let dst_ret = crate::gcu_backend::GcuStorage {
+                slice: GcuStorageSlice::U32(dst),
+                device: dev.clone(),
+            };
+            Ok((dst_ret, layout.shape().clone()))
+        }
     }
 }
 

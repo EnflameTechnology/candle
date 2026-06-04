@@ -35,6 +35,7 @@ cuda = ["candle/cuda"]
 mkl = ["dep:intel-mkl-src", "candle/mkl"]
 metal = ["candle/metal", "dep:candle-metal-kernels", "dep:metal"]
 gcu = ["candle/gcu"]
+aten = ["candle/aten"]
 eccl = ["candle/gcu", "candle/eccl"]
 nccl = ["candle/cuda", "candle/nccl"]
 
