@@ -447,6 +447,16 @@ impl QTensor {
             }
         }
     }
+
+    #[cfg(feature = "metal")]
+    pub fn metal_buffer(&self) -> Result<&::metal::Buffer> {
+        match &self.storage {
+            QStorage::Metal(storage) => Ok(storage.buffer()),
+            _ => {
+                crate::bail!("QTensor is not on a Metal device");
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
