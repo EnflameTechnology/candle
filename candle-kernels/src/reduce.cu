@@ -50,6 +50,40 @@ fast_sum(const size_t src_numel, const size_t el_to_sum_per_block,
     dst[dst_id] = shr[0];
 }
 
+#if __CUDA_ARCH__ >= 530
+__device__ void
+fast_sum_f16_acc(const size_t src_numel, const size_t el_to_sum_per_block,
+                 const size_t num_dims, const size_t *info,
+                 const __half *src, __half *dst) {
+  const size_t *dims = info;
+  const size_t *strides = info + num_dims;
+
+  __shared__ float shr[BLOCK_SIZE];
+  size_t tid = threadIdx.x;
+  size_t dst_id = blockIdx.x;
+
+  shr[tid] = 0.0f;
+  size_t start_idx = dst_id * el_to_sum_per_block;
+  size_t stop_idx = min(start_idx + el_to_sum_per_block, src_numel);
+  size_t idx = start_idx + tid;
+
+  while (idx < stop_idx) {
+    size_t strided_i = get_strided_index(idx, num_dims, dims, strides);
+    shr[tid] += __half2float(src[strided_i]);
+    idx += blockDim.x;
+  }
+
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    __syncthreads();
+    if (tid < s)
+      shr[tid] += shr[tid + s];
+  }
+
+  if (tid == 0)
+    dst[dst_id] = __float2half(shr[0]);
+}
+#endif
+
 // Specialized vectorized fast_sum for bf16: 8 elements per float4 load
 #if __CUDA_ARCH__ >= 800
 __device__ void
@@ -259,11 +293,11 @@ __device__ void softmax(const T * x, T * dst, const int ncols) {
     const int block_size = blockDim.y;
     const int tid = threadIdx.y;
 
-    T max_val = -INFINITY;
+    ACC max_val = -INFINITY;
 
     for (int col = tid; col < ncols; col += block_size) {
         const int i = row*ncols + col;
-        max_val = maxg(max_val, x[i]);
+        max_val = maxg(max_val, static_cast<ACC>(x[i]));
     }
 
     // find the max value in the block
@@ -276,9 +310,8 @@ __device__ void softmax(const T * x, T * dst, const int ncols) {
 
     for (int col = tid; col < ncols; col += block_size) {
         const int i = row*ncols + col;
-        const T val = expg(x[i] - max_val);
-        tmp += static_cast<ACC>(val);
-        dst[i] = val;
+        const ACC val = expg(static_cast<ACC>(x[i]) - max_val);
+        tmp += val;
     }
 
     // sum up partial sums
@@ -291,7 +324,7 @@ __device__ void softmax(const T * x, T * dst, const int ncols) {
 
     for (int col = tid; col < ncols; col += block_size) {
         const int i = row*ncols + col;
-        dst[i] *= inv_tmp;
+        dst[i] = static_cast<T>(expg(static_cast<ACC>(x[i]) - max_val) * inv_tmp);
     }
 }
 
@@ -745,7 +778,27 @@ extern "C" __global__ void fast_sum_small_f16(
     const size_t src_numel, const size_t el_to_sum_per_block,
     const size_t num_dims, const size_t *info, const __half *src,
     __half *dst) {
-  fast_sum_small_impl(src_numel, el_to_sum_per_block, num_dims, info, src, dst);
+  const size_t *dims = info;
+  const size_t *strides = info + num_dims;
+  const size_t dst_el = src_numel / el_to_sum_per_block;
+  size_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gid >= dst_el) return;
+
+  float sum = 0.0f;
+
+  if (is_contiguous(num_dims, dims, strides)) {
+    size_t start = gid * el_to_sum_per_block;
+    for (size_t i = 0; i < el_to_sum_per_block; ++i) {
+      sum += __half2float(src[start + i]);
+    }
+  } else {
+    for (size_t i = 0; i < el_to_sum_per_block; ++i) {
+      size_t strided_i = get_strided_index(gid * el_to_sum_per_block + i, num_dims, dims, strides);
+      sum += __half2float(src[strided_i]);
+    }
+  }
+
+  dst[gid] = __float2half(sum);
 }
 #endif
 
@@ -795,7 +848,36 @@ RMSNORM_OP(__half, rmsnorm_f16)
 LAYERNORM_OP(__half, layernorm_f16)
 ROPE_OP(__half, rope_f16, rope_i_f16, rope_thd_f16)
 SUM_OP(__half, sum_f16)
-FAST_OP(__half, fast_min_f16, fast_max_f16, fast_argmin_f16, fast_argmax_f16, fast_sum_f16)
+extern "C" __global__ void fast_argmin_f16(
+    const size_t src_numel, const size_t el_to_sum_per_block,
+    const size_t num_dims, const size_t *info, const __half *src,
+    uint32_t *dst) {
+  fast_argmin(src_numel, el_to_sum_per_block, num_dims, info, src, dst);
+}
+extern "C" __global__ void fast_argmax_f16(
+    const size_t src_numel, const size_t el_to_sum_per_block,
+    const size_t num_dims, const size_t *info, const __half *src,
+    uint32_t *dst) {
+  fast_argmax(src_numel, el_to_sum_per_block, num_dims, info, src, dst);
+}
+extern "C" __global__ void fast_min_f16(
+    const size_t src_numel, const size_t el_to_sum_per_block,
+    const size_t num_dims, const size_t *info, const __half *src,
+    __half *dst) {
+  fast_min(src_numel, el_to_sum_per_block, num_dims, info, src, dst);
+}
+extern "C" __global__ void fast_max_f16(
+    const size_t src_numel, const size_t el_to_sum_per_block,
+    const size_t num_dims, const size_t *info, const __half *src,
+    __half *dst) {
+  fast_max(src_numel, el_to_sum_per_block, num_dims, info, src, dst);
+}
+extern "C" __global__ void fast_sum_f16(
+    const size_t src_numel, const size_t el_to_sum_per_block,
+    const size_t num_dims, const size_t *info, const __half *src,
+    __half *dst) {
+  fast_sum_f16_acc(src_numel, el_to_sum_per_block, num_dims, info, src, dst);
+}
 #endif
 
 SUM_OP(float, sum_f32)
