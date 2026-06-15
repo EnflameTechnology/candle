@@ -493,6 +493,35 @@ impl QCudaStorage {
         })
     }
 
+    pub(crate) fn from_cpu_data(
+        device: &CudaDevice,
+        elem_count: usize,
+        dtype: GgmlDType,
+        data: &[u8],
+    ) -> Result<Self> {
+        let size_in_bytes = ceil_div(elem_count, dtype.block_size()) * dtype.type_size();
+        if data.len() != size_in_bytes {
+            crate::bail!(
+                "invalid quantized cuda upload size: got {}, expected {}",
+                data.len(),
+                size_in_bytes
+            )
+        }
+        let padded_len = data.len() + MATRIX_ROW_PADDING * dtype.type_size() / dtype.block_size();
+        let mut inner = unsafe { device.alloc::<u8>(padded_len).w()? };
+        device
+            .htod_sync_copy_into(data, &mut inner.slice_mut(..data.len()))
+            .w()?;
+        Ok(QCudaStorage {
+            data: PaddedCudaSlice {
+                inner,
+                len: data.len(),
+            },
+            device: device.clone(),
+            dtype,
+        })
+    }
+
     pub fn dtype(&self) -> GgmlDType {
         self.dtype
     }

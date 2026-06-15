@@ -337,6 +337,19 @@ impl QTensor {
         Ok(Self { storage, shape })
     }
 
+    pub fn supports_native_quantize(device: &Device, dtype: GgmlDType) -> bool {
+        match device {
+            Device::Cpu => true,
+            Device::Cuda(_) => {
+                matches!(
+                    dtype,
+                    GgmlDType::Q4K | GgmlDType::Q6K | GgmlDType::Q8_0 | GgmlDType::Q8_1
+                )
+            }
+            Device::Metal(_) => false,
+        }
+    }
+
     pub fn quantize(src: &Tensor, dtype: GgmlDType) -> Result<Self> {
         let shape = src.shape();
         let block_size = dtype.block_size();
@@ -359,6 +372,87 @@ impl QTensor {
             storage,
             shape: shape.clone(),
         })
+    }
+
+    pub fn quantize_owned(src: Tensor, dtype: GgmlDType) -> Result<Self> {
+        let shape = src.shape().clone();
+        let block_size = dtype.block_size();
+        check_shape(&shape, block_size)?;
+        let elem_count = shape.elem_count();
+        if elem_count % block_size != 0 {
+            crate::bail!(
+                "tensor size ({shape:?}) is not divisible by block size {}",
+                block_size
+            )
+        }
+        let src = if src.dtype() != crate::DType::F32 {
+            let converted = src.to_dtype(crate::DType::F32)?;
+            drop(src);
+            converted
+        } else {
+            src
+        };
+        let src = {
+            let flattened = src.flatten_all()?;
+            drop(src);
+            flattened
+        };
+        let mut storage = src.device().qzeros(elem_count, dtype)?;
+        storage.quantize(&src.storage())?;
+        Ok(Self { storage, shape })
+    }
+
+    pub fn quantize_on_device(src: &Tensor, dtype: GgmlDType, device: &Device) -> Result<Self> {
+        let shape = src.shape().clone();
+        let block_size = dtype.block_size();
+        check_shape(&shape, block_size)?;
+        let elem_count = shape.elem_count();
+        if elem_count % block_size != 0 {
+            crate::bail!(
+                "tensor size ({shape:?}) is not divisible by block size {}",
+                block_size
+            )
+        }
+
+        match device {
+            Device::Metal(_) | Device::Cuda(_) => {
+                let cpu_src = src.to_device(&Device::Cpu)?;
+                let cpu_src = if cpu_src.dtype() != crate::DType::F32 {
+                    cpu_src.to_dtype(crate::DType::F32)?.flatten_all()?
+                } else {
+                    cpu_src.flatten_all()?
+                };
+                let mut cpu_storage = Device::Cpu.qzeros(elem_count, dtype)?;
+                cpu_storage.quantize(&cpu_src.storage())?;
+                let data = cpu_storage.data()?;
+                let storage = match device {
+                    Device::Metal(metal) => {
+                        let storage = metal::QMetalStorage::from_cpu_data(
+                            metal,
+                            elem_count,
+                            dtype,
+                            data.as_ref(),
+                        )?;
+                        QStorage::Metal(storage)
+                    }
+                    Device::Cuda(cuda) => {
+                        let storage = cuda::QCudaStorage::from_cpu_data(
+                            cuda,
+                            elem_count,
+                            dtype,
+                            data.as_ref(),
+                        )?;
+                        QStorage::Cuda(storage)
+                    }
+                    Device::Cpu => unreachable!(),
+                };
+                Ok(Self { storage, shape })
+            }
+            _ => {
+                let src = src.to_device(device)?;
+                Self::quantize(&src, dtype)
+            }
+        }
     }
 
     pub fn dtype(&self) -> GgmlDType {

@@ -408,6 +408,69 @@ impl TensorInfo {
             device,
         )
     }
+
+    pub fn read_shard<R: std::io::Seek + std::io::Read>(
+        &self,
+        reader: &mut R,
+        tensor_data_offset: u64,
+        dim: usize,
+        rank: usize,
+        world_size: usize,
+        device: &Device,
+    ) -> Result<Option<QTensor>> {
+        if world_size <= 1 {
+            return self.read(reader, tensor_data_offset, device).map(Some);
+        }
+        if self.src_ggml_dtype.is_some() {
+            return Ok(None);
+        }
+
+        let dims = self.shape.dims();
+        if dim >= dims.len() {
+            crate::bail!(
+                "cannot shard GGUF tensor with shape {:?} on dim {dim}",
+                self.shape
+            );
+        }
+        if rank >= world_size {
+            crate::bail!("rank {rank} must be smaller than world_size {world_size}");
+        }
+        if dims[dim] % world_size != 0 {
+            crate::bail!(
+                "cannot shard GGUF tensor with shape {:?} on dim {dim} into {world_size} parts",
+                self.shape
+            );
+        }
+
+        let block_size = self.ggml_dtype.block_size();
+        let type_size = self.ggml_dtype.type_size();
+        let inner_elems = dims[dim + 1..].iter().product::<usize>();
+        let outer_count = dims[..dim].iter().product::<usize>();
+        let local_dim = dims[dim] / world_size;
+        let start_dim = rank * local_dim;
+        let stride_elems = dims[dim] * inner_elems;
+        let segment_start = start_dim * inner_elems;
+        let segment_elems = local_dim * inner_elems;
+        if segment_start % block_size != 0 || segment_elems % block_size != 0 {
+            return Ok(None);
+        }
+
+        let bytes_per_segment = segment_elems / block_size * type_size;
+        let mut raw_data = vec![0u8; bytes_per_segment * outer_count];
+        let base_offset = tensor_data_offset + self.offset;
+        for outer_idx in 0..outer_count {
+            let elem_offset = outer_idx * stride_elems + segment_start;
+            let byte_offset = elem_offset / block_size * type_size;
+            let dst_start = outer_idx * bytes_per_segment;
+            reader.seek(std::io::SeekFrom::Start(base_offset + byte_offset as u64))?;
+            reader.read_exact(&mut raw_data[dst_start..dst_start + bytes_per_segment])?;
+        }
+
+        let mut shard_dims = dims.to_vec();
+        shard_dims[dim] = local_dim;
+        super::ggml_file::qtensor_from_ggml(self.ggml_dtype, &raw_data, shard_dims, device)
+            .map(Some)
+    }
 }
 
 fn compat_target_dtype() -> Result<GgmlDType> {
@@ -984,6 +1047,29 @@ impl Content {
             None => crate::bail!("cannot find tensor info for {name}"),
         };
         tensor_info.read(reader, self.tensor_data_offset, device)
+    }
+
+    pub fn tensor_shard<R: std::io::Seek + std::io::Read>(
+        &self,
+        reader: &mut R,
+        name: &str,
+        dim: usize,
+        rank: usize,
+        world_size: usize,
+        device: &Device,
+    ) -> Result<Option<QTensor>> {
+        let tensor_info = match self.tensor_infos.get(name) {
+            Some(tensor_info) => tensor_info,
+            None => crate::bail!("cannot find tensor info for {name}"),
+        };
+        tensor_info.read_shard(
+            reader,
+            self.tensor_data_offset,
+            dim,
+            rank,
+            world_size,
+            device,
+        )
     }
 }
 

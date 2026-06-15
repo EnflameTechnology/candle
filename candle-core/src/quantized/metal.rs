@@ -21,6 +21,28 @@ impl QMetalStorage {
         })
     }
 
+    pub(crate) fn from_cpu_data(
+        device: &MetalDevice,
+        elem_count: usize,
+        dtype: GgmlDType,
+        data: &[u8],
+    ) -> Result<Self> {
+        let size = elem_count * dtype.type_size() / dtype.block_size();
+        if data.len() != size {
+            crate::bail!(
+                "invalid quantized metal upload size: got {}, expected {}",
+                data.len(),
+                size
+            )
+        }
+        let buffer = device.new_private_buffer_with_data(data, "quantized_weight")?;
+        Ok(Self {
+            buffer,
+            device: device.clone(),
+            dtype,
+        })
+    }
+
     pub fn dtype(&self) -> GgmlDType {
         self.dtype
     }
