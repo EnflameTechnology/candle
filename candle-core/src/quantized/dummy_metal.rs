@@ -12,6 +12,10 @@ impl QMetalStorage {
         Err(Error::NotCompiledWithMetalSupport)
     }
 
+    pub(crate) fn from_cpu_data(_: &MetalDevice, _: usize, _: GgmlDType, _: &[u8]) -> Result<Self> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
+
     pub fn dtype(&self) -> GgmlDType {
         self.dtype
     }
