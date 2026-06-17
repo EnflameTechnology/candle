@@ -43,6 +43,10 @@ impl TryFrom<st::Dtype> for DType {
             st::Dtype::F64 => Ok(DType::F64),
             st::Dtype::I32 => Ok(DType::U32),
             st::Dtype::F8_E4M3 => Ok(DType::U8),
+            st::Dtype::F8_E8M0 => Ok(DType::U8),
+            st::Dtype::F8_E4M3FNUZ => Ok(DType::U8),
+            st::Dtype::F8_E5M2FNUZ => Ok(DType::U8),
+            st::Dtype::F4 => Ok(DType::U8),
             dtype => Err(Error::UnsupportedSafeTensorDtype(dtype)),
         }
     }
@@ -93,7 +97,7 @@ impl st::View for &Tensor {
 impl Tensor {
     pub fn save_safetensors<P: AsRef<Path>>(&self, name: &str, filename: P) -> Result<()> {
         let data = [(name, self.clone())];
-        Ok(st::serialize_to_file(data, &None, filename.as_ref())?)
+        Ok(st::serialize_to_file(data, None, filename.as_ref())?)
     }
 }
 
@@ -227,6 +231,10 @@ fn convert(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
         st::Dtype::F32 => convert_::<f32>(view, device),
         st::Dtype::F64 => convert_::<f64>(view, device),
         st::Dtype::F8_E4M3 => convert_::<u8>(view, device),
+        st::Dtype::F8_E8M0 => convert_::<u8>(view, device),
+        st::Dtype::F8_E4M3FNUZ => convert_::<u8>(view, device),
+        st::Dtype::F8_E5M2FNUZ => convert_::<u8>(view, device),
+        st::Dtype::F4 => convert_::<u8>(view, device),
         dtype => Err(Error::UnsupportedSafeTensorDtype(dtype)),
     }
 }
@@ -262,7 +270,7 @@ pub fn save<K: AsRef<str> + Ord + std::fmt::Display, P: AsRef<Path>>(
     tensors: &HashMap<K, Tensor>,
     filename: P,
 ) -> Result<()> {
-    Ok(st::serialize_to_file(tensors, &None, filename.as_ref())?)
+    Ok(st::serialize_to_file(tensors, None, filename.as_ref())?)
 }
 
 #[derive(yoke::Yokeable)]
