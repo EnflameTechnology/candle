@@ -37,6 +37,7 @@ pub use ubridge;
 use ubridge::gcu_device::GcuDevice as RawDevice;
 use ubridge::gcu_launch::GcuLaunchAsync;
 use ubridge::gcu_slice::{GcuSlice, GcuView, GcuViewMut};
+use ubridge::prelude::tops::error::ToResult;
 use ubridge::prelude::{DevicePtr, DeviceSlice};
 use uhal::error::DeviceError;
 use uhal::memory::DevicePointerTrait;
@@ -318,78 +319,119 @@ impl GcuDevice {
     }
 
     fn const_impl(&self, v: f64, shape: &Shape, dtype: DType) -> Result<GcuStorage> {
+        use ubridge::gcu_device::driv;
         let elem_count = shape.elem_count();
+        let stream = self.device.stream_inner().expect("unable to obtain stream");
         let slice = match dtype {
             DType::U8 => {
-                // SAFETY: Set later by running the fill kernel.
                 let data = self.alloc::<u8>(elem_count).w()?;
-                let func = self.get_or_load_func("fill_u8", ubridge::FILL)?;
-                let params = (data.device_ptr(), v as u8, elem_count);
-                unsafe { func.launch(&self.launch_cfg, params).w()? };
+                unsafe {
+                    driv::topsMemsetD8Async(data.device_ptr(), v as u8, elem_count, stream)
+                        .to_result()
+                        .w()?;
+                }
                 GcuStorageSlice::U8(data)
             }
             DType::I8 => {
-                // SAFETY: Set later by running the fill kernel.
                 let data = self.alloc::<i8>(elem_count).w()?;
-                let func = self.get_or_load_func("fill_i8", ubridge::FILL)?;
-                let params = (data.device_ptr(), v as u8, elem_count);
-                unsafe { func.launch(&self.launch_cfg, params).w()? };
+                unsafe {
+                    driv::topsMemsetD8Async(data.device_ptr(), v as u8, elem_count, stream)
+                        .to_result()
+                        .w()?;
+                }
                 GcuStorageSlice::I8(data)
             }
             DType::U32 => {
-                // SAFETY: Set later by running the fill kernel.
                 let data = self.alloc::<u32>(elem_count).w()?;
-                let func = self.get_or_load_func("fill_u32", ubridge::FILL)?;
-                let params = (data.device_ptr(), v as u32, elem_count);
-                unsafe { func.launch(&self.launch_cfg, params).w()? };
+                unsafe {
+                    driv::topsMemsetD32Async(
+                        data.device_ptr(),
+                        v as u32 as i32,
+                        elem_count,
+                        stream,
+                    )
+                    .to_result()
+                    .w()?;
+                }
                 GcuStorageSlice::U32(data)
             }
             DType::I32 => {
-                // SAFETY: Set later by running the fill kernel.
                 let data = self.alloc::<i32>(elem_count).w()?;
-                let func = self.get_or_load_func("fill_i32", ubridge::FILL)?;
-                let params = (data.device_ptr(), v as i32, elem_count);
-                unsafe { func.launch(&self.launch_cfg, params).w()? };
+                unsafe {
+                    driv::topsMemsetD32Async(data.device_ptr(), v as i32, elem_count, stream)
+                        .to_result()
+                        .w()?;
+                }
                 GcuStorageSlice::I32(data)
             }
             DType::I64 => {
-                // SAFETY: Set later by running the fill kernel.
                 let data = self.alloc::<i64>(elem_count).w()?;
-                let func = self.get_or_load_func("fill_i64", ubridge::FILL)?;
-                let params = (data.device_ptr(), v as i64, elem_count);
-                unsafe { func.launch(&self.launch_cfg, params).w()? };
+                let val_bytes = (v as i64).to_ne_bytes();
+                let lo =
+                    i32::from_ne_bytes([val_bytes[0], val_bytes[1], val_bytes[2], val_bytes[3]]);
+                let hi =
+                    i32::from_ne_bytes([val_bytes[4], val_bytes[5], val_bytes[6], val_bytes[7]]);
+                if lo == hi {
+                    unsafe {
+                        driv::topsMemsetD32Async(data.device_ptr(), lo, elem_count * 2, stream)
+                            .to_result()
+                            .w()?;
+                    }
+                } else {
+                    let func = self.get_or_load_func("fill_i64", ubridge::FILL)?;
+                    let params = (data.device_ptr(), elem_count as i32, v as i64);
+                    unsafe { func.launch(&self.launch_cfg, params).w()? };
+                }
                 GcuStorageSlice::I64(data)
             }
             DType::BF16 => {
-                // SAFETY: Set later by running the fill kernel.
                 let data = self.alloc::<bf16>(elem_count).w()?;
-                let func = self.get_or_load_func("fill_bf16", ubridge::FILL)?;
-                let params = (data.device_ptr(), bf16::from_f64(v), elem_count);
-                unsafe { func.launch(&self.launch_cfg, params).w()? };
+                let raw_bits = bf16::from_f64(v).to_bits();
+                unsafe {
+                    driv::topsMemsetD16Async(data.device_ptr(), raw_bits, elem_count, stream)
+                        .to_result()
+                        .w()?;
+                }
                 GcuStorageSlice::BF16(data)
             }
             DType::F16 => {
-                // SAFETY: Set later by running the fill kernel.
                 let data = self.device.alloc::<f16>(elem_count).w()?;
-                let func = self.get_or_load_func("fill_f16", ubridge::FILL)?;
-                let params = (data.device_ptr(), f16::from_f64(v), elem_count);
-                unsafe { func.launch(&self.launch_cfg, params).w()? };
+                let raw_bits = f16::from_f64(v).to_bits();
+                unsafe {
+                    driv::topsMemsetD16Async(data.device_ptr(), raw_bits, elem_count, stream)
+                        .to_result()
+                        .w()?;
+                }
                 GcuStorageSlice::F16(data)
             }
             DType::F32 => {
-                // SAFETY: Set later by running the fill kernel.
                 let data = self.device.alloc::<f32>(elem_count).w()?;
-                let func = self.get_or_load_func("fill_f32", ubridge::FILL)?;
-                let params = (data.device_ptr(), v as f32, elem_count);
-                unsafe { func.launch(&self.launch_cfg, params).w()? };
+                let raw_bits = (v as f32).to_bits() as i32;
+                unsafe {
+                    driv::topsMemsetD32Async(data.device_ptr(), raw_bits, elem_count, stream)
+                        .to_result()
+                        .w()?;
+                }
                 GcuStorageSlice::F32(data)
             }
             DType::F64 => {
-                // SAFETY: Set later by running the fill kernel.
                 let data = self.device.alloc::<f64>(elem_count).w()?;
-                let func = self.get_or_load_func("fill_f64", ubridge::FILL)?;
-                let params = (data.device_ptr(), v, elem_count);
-                unsafe { func.launch(&self.launch_cfg, params).w()? };
+                let val_bytes = v.to_ne_bytes();
+                let lo =
+                    i32::from_ne_bytes([val_bytes[0], val_bytes[1], val_bytes[2], val_bytes[3]]);
+                let hi =
+                    i32::from_ne_bytes([val_bytes[4], val_bytes[5], val_bytes[6], val_bytes[7]]);
+                if lo == hi {
+                    unsafe {
+                        driv::topsMemsetD32Async(data.device_ptr(), lo, elem_count * 2, stream)
+                            .to_result()
+                            .w()?;
+                    }
+                } else {
+                    let func = self.get_or_load_func("fill_f64", ubridge::FILL)?;
+                    let params = (data.device_ptr(), elem_count as i32, v);
+                    unsafe { func.launch(&self.launch_cfg, params).w()? };
+                }
                 GcuStorageSlice::F64(data)
             }
         };
