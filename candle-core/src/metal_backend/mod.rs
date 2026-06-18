@@ -103,6 +103,7 @@ impl BackendStorage for MetalStorage {
             DType::BF16 => Ok(CpuStorage::BF16(self.to_cpu()?)),
             DType::F32 => Ok(CpuStorage::F32(self.to_cpu()?)),
             DType::F64 => Ok(CpuStorage::F64(self.to_cpu()?)),
+            DType::F8E8M0 | DType::F8E4M3 => Ok(CpuStorage::U8(self.to_cpu()?)),
         }
     }
 
@@ -1981,6 +1982,7 @@ impl BackendDevice for MetalDevice {
             DType::F16 => "fill_f16",
             DType::BF16 => "fill_bf16",
             DType::F32 => "fill_f32",
+            DType::F8E8M0 | DType::F8E4M3 => "fill_u8",
             DType::F64 => {
                 let cpu_storage = crate::cpu_backend::CpuDevice.ones_impl(shape, dtype)?;
                 return self.storage_from_cpu_storage(&cpu_storage);

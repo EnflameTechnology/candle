@@ -144,6 +144,16 @@ impl OffloadBuffer {
                     self.len,
                     &dev,
                 )?),
+                DType::F8E8M0 => Storage::Cuda(storage_from_buffer(
+                    self.ptr_host as *mut u8,
+                    self.len,
+                    &dev,
+                )?),
+                DType::F8E4M3 => Storage::Cuda(storage_from_buffer(
+                    self.ptr_host as *mut u8,
+                    self.len,
+                    &dev,
+                )?),
             },
             _ => {
                 panic!("not supported device for cpu offloading")

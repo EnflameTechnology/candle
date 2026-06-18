@@ -88,6 +88,8 @@ impl Header {
             DType::I64 => "i8",
             DType::U32 => "u4",
             DType::U8 => "u1",
+            DType::F8E8M0 => Err(Error::Npy("F8E8M0 not supported for npy".into()))?,
+            DType::F8E4M3 => Err(Error::Npy("F8E4M3 not supported for npy".into()))?,
         };
         if !shape.is_empty() {
             shape.push(',')
@@ -239,6 +241,8 @@ impl Tensor {
                 reader.read_i64_into::<LittleEndian>(&mut data_t)?;
                 Tensor::from_vec(data_t, shape, &Device::Cpu)
             }
+            DType::F8E8M0 => Err(Error::Npy("F8E8M0 not supported for npy".into()))?,
+            DType::F8E4M3 => Err(Error::Npy("F8E4M3 not supported for npy".into()))?,
         }
     }
 

@@ -1842,6 +1842,8 @@ impl BackendStorage for CpuStorage {
                 let data = unary_map(storage, layout, |v| v);
                 Ok(Self::F64(data))
             }
+            (_, DType::F8E8M0) => Err(Error::UnsupportedDTypeForOp(DType::F8E8M0, "to_dtype").bt()),
+            (_, DType::F8E4M3) => Err(Error::UnsupportedDTypeForOp(DType::F8E4M3, "to_dtype").bt()),
         }
     }
 
@@ -2484,7 +2486,7 @@ impl BackendDevice for CpuDevice {
         let elem_count = shape.elem_count();
         let mut rng = rand::rng();
         match dtype {
-            DType::U8 | DType::U32 | DType::I64 => {
+            DType::U8 | DType::U32 | DType::I64 | DType::F8E8M0 | DType::F8E4M3 => {
                 Err(Error::UnsupportedDTypeForOp(dtype, "rand_uniform").bt())
             }
             DType::BF16 => {
@@ -2531,7 +2533,7 @@ impl BackendDevice for CpuDevice {
         let elem_count = shape.elem_count();
         let mut rng = rand::rng();
         match dtype {
-            DType::U8 | DType::U32 | DType::I64 => {
+            DType::U8 | DType::U32 | DType::I64 | DType::F8E8M0 | DType::F8E4M3 => {
                 Err(Error::UnsupportedDTypeForOp(dtype, "rand_normal").bt())
             }
             DType::BF16 => {
@@ -2580,7 +2582,7 @@ impl BackendDevice for CpuDevice {
         // It's still pretty risky, see the following for more details:
         // https://github.com/rust-lang/rust-clippy/issues/4483
         let storage = match dtype {
-            DType::U8 => {
+            DType::U8 | DType::F8E8M0 | DType::F8E4M3 => {
                 let mut v = Vec::with_capacity(elem_count);
                 v.set_len(elem_count);
                 CpuStorage::U8(v)
@@ -2622,7 +2624,7 @@ impl BackendDevice for CpuDevice {
     fn ones_impl(&self, shape: &Shape, dtype: DType) -> Result<CpuStorage> {
         let elem_count = shape.elem_count();
         let storage = match dtype {
-            DType::U8 => CpuStorage::U8(vec![1u8; elem_count]),
+            DType::U8 | DType::F8E8M0 | DType::F8E4M3 => CpuStorage::U8(vec![1u8; elem_count]),
             DType::U32 => CpuStorage::U32(vec![1u32; elem_count]),
             DType::I64 => CpuStorage::I64(vec![1i64; elem_count]),
             DType::BF16 => CpuStorage::BF16(vec![bf16::ONE; elem_count]),
@@ -2636,7 +2638,7 @@ impl BackendDevice for CpuDevice {
     fn zeros_impl(&self, shape: &Shape, dtype: DType, _sync_alloc: bool) -> Result<CpuStorage> {
         let elem_count = shape.elem_count();
         let storage = match dtype {
-            DType::U8 => CpuStorage::U8(vec![0u8; elem_count]),
+            DType::U8 | DType::F8E8M0 | DType::F8E4M3 => CpuStorage::U8(vec![0u8; elem_count]),
             DType::U32 => CpuStorage::U32(vec![0u32; elem_count]),
             DType::I64 => CpuStorage::I64(vec![0i64; elem_count]),
             DType::BF16 => CpuStorage::BF16(vec![bf16::ZERO; elem_count]),
@@ -2649,6 +2651,90 @@ impl BackendDevice for CpuDevice {
 
     fn synchronize(&self) -> Result<()> {
         Ok(())
+    }
+}
+
+pub(crate) fn f8e8m0_to_f32(storage: &CpuStorage, layout: &Layout) -> Result<CpuStorage> {
+    match storage {
+        CpuStorage::U8(data) => Ok(CpuStorage::F32(unary_map(data, layout, |v: u8| {
+            crate::f8e8m0_decode(v)
+        }))),
+        s => Err(Error::UnexpectedDType {
+            expected: DType::U8,
+            got: s.dtype(),
+            msg: "F8E8M0 expects U8 storage",
+        }
+        .bt()),
+    }
+}
+
+pub(crate) fn f8e8m0_to_bf16(storage: &CpuStorage, layout: &Layout) -> Result<CpuStorage> {
+    match storage {
+        CpuStorage::U8(data) => Ok(CpuStorage::BF16(unary_map(data, layout, |v: u8| {
+            bf16::from_f32(crate::f8e8m0_decode(v))
+        }))),
+        s => Err(Error::UnexpectedDType {
+            expected: DType::U8,
+            got: s.dtype(),
+            msg: "F8E8M0 expects U8 storage",
+        }
+        .bt()),
+    }
+}
+
+pub(crate) fn f8e4m3_to_f16(storage: &CpuStorage, layout: &Layout) -> Result<CpuStorage> {
+    match storage {
+        CpuStorage::U8(data) => Ok(CpuStorage::F16(unary_map(data, layout, |v: u8| {
+            f16::from_f32(crate::f8e4m3_decode(v))
+        }))),
+        s => Err(Error::UnexpectedDType {
+            expected: DType::U8,
+            got: s.dtype(),
+            msg: "F8E4M3 expects U8 storage",
+        }
+        .bt()),
+    }
+}
+
+pub(crate) fn f8e4m3_to_bf16(storage: &CpuStorage, layout: &Layout) -> Result<CpuStorage> {
+    match storage {
+        CpuStorage::U8(data) => Ok(CpuStorage::BF16(unary_map(data, layout, |v: u8| {
+            bf16::from_f32(crate::f8e4m3_decode(v))
+        }))),
+        s => Err(Error::UnexpectedDType {
+            expected: DType::U8,
+            got: s.dtype(),
+            msg: "F8E4M3 expects U8 storage",
+        }
+        .bt()),
+    }
+}
+
+pub(crate) fn f8e4m3_to_f32(storage: &CpuStorage, layout: &Layout) -> Result<CpuStorage> {
+    match storage {
+        CpuStorage::U8(data) => Ok(CpuStorage::F32(unary_map(data, layout, |v: u8| {
+            crate::f8e4m3_decode(v)
+        }))),
+        s => Err(Error::UnexpectedDType {
+            expected: DType::U8,
+            got: s.dtype(),
+            msg: "F8E4M3 expects U8 storage",
+        }
+        .bt()),
+    }
+}
+
+pub(crate) fn f8e8m0_to_f16(storage: &CpuStorage, layout: &Layout) -> Result<CpuStorage> {
+    match storage {
+        CpuStorage::U8(data) => Ok(CpuStorage::F16(unary_map(data, layout, |v: u8| {
+            f16::from_f32(crate::f8e8m0_decode(v))
+        }))),
+        s => Err(Error::UnexpectedDType {
+            expected: DType::U8,
+            got: s.dtype(),
+            msg: "F8E8M0 expects U8 storage",
+        }
+        .bt()),
     }
 }
 

@@ -205,6 +205,8 @@ trait MapDType {
             DType::F16 => self.f::<f16>(t),
             DType::F32 => self.f::<f32>(t),
             DType::F64 => self.f::<f64>(t),
+            DType::F8E8M0 => self.f::<u8>(t),
+            DType::F8E4M3 => self.f::<u8>(t),
         }
     }
 }

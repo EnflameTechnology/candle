@@ -1221,6 +1221,116 @@ fn gemm_config<T>(
     })
 }
 
+impl CudaStorage {
+    /// Convert F8E8M0 (U8-backed) storage to another dtype using E8M0-aware kernels.
+    pub(crate) fn to_dtype_from_f8e8m0(&self, layout: &Layout, dtype: DType) -> Result<Self> {
+        let shape = layout.shape();
+        let dims = shape.dims();
+        let el = shape.elem_count();
+        let cfg = LaunchConfig::for_num_elems(el as u32);
+        let dev = self.device();
+        let ds = SlicePtrOrNull::params_from_layout(dev, layout)?;
+        let start_o = layout.start_offset();
+        let inp = match &self.slice {
+            CudaStorageSlice::U8(inp) => *inp.slice(start_o..).device_ptr(),
+            _ => Err(crate::Error::UnexpectedDType {
+                expected: DType::U8,
+                got: self.dtype(),
+                msg: "F8E8M0 expects U8 storage",
+            }
+            .bt())?,
+        };
+        let inp = &inp;
+
+        let (kernel_name, out_dtype) = match dtype {
+            DType::F32 => ("cast_f8e8m0_f32", DType::F32),
+            DType::BF16 => ("cast_f8e8m0_bf16", DType::BF16),
+            DType::F16 => {
+                let f32_storage = self.to_dtype_from_f8e8m0(layout, DType::F32)?;
+                return f32_storage.to_dtype(layout, DType::F16);
+            }
+            _ => {
+                let f32_storage = self.to_dtype_from_f8e8m0(layout, DType::F32)?;
+                return f32_storage.to_dtype(layout, dtype);
+            }
+        };
+        let func = dev.get_or_load_func(kernel_name, kernels::CAST)?;
+        let slice = match out_dtype {
+            DType::BF16 => {
+                let out = unsafe { dev.alloc::<bf16>(el) }.w()?;
+                let params = (el, dims.len(), &ds, *inp, &out);
+                unsafe { func.launch(cfg, params) }.w()?;
+                CudaStorageSlice::BF16(out)
+            }
+            DType::F32 => {
+                let out = unsafe { dev.alloc::<f32>(el) }.w()?;
+                let params = (el, dims.len(), &ds, *inp, &out);
+                unsafe { func.launch(cfg, params) }.w()?;
+                CudaStorageSlice::F32(out)
+            }
+            _ => unreachable!(),
+        };
+        Ok(Self {
+            slice,
+            device: dev.clone(),
+        })
+    }
+
+    /// Convert F8E4M3 (U8-backed) storage to another dtype using E4M3-aware kernels.
+    pub(crate) fn to_dtype_from_f8e4m3(&self, layout: &Layout, dtype: DType) -> Result<Self> {
+        let shape = layout.shape();
+        let dims = shape.dims();
+        let el = shape.elem_count();
+        let cfg = LaunchConfig::for_num_elems(el as u32);
+        let dev = self.device();
+        let ds = SlicePtrOrNull::params_from_layout(dev, layout)?;
+        let start_o = layout.start_offset();
+        let inp = match &self.slice {
+            CudaStorageSlice::U8(inp) => *inp.slice(start_o..).device_ptr(),
+            _ => Err(crate::Error::UnexpectedDType {
+                expected: DType::U8,
+                got: self.dtype(),
+                msg: "F8E4M3 expects U8 storage",
+            }
+            .bt())?,
+        };
+        let inp = &inp;
+
+        let (kernel_name, out_dtype) = match dtype {
+            DType::F32 => ("cast_f8e4m3_f32", DType::F32),
+            DType::BF16 => ("cast_f8e4m3_bf16", DType::BF16),
+            DType::F16 => {
+                let f32_storage = self.to_dtype_from_f8e4m3(layout, DType::F32)?;
+                return f32_storage.to_dtype(layout, DType::F16);
+            }
+            _ => {
+                let f32_storage = self.to_dtype_from_f8e4m3(layout, DType::F32)?;
+                return f32_storage.to_dtype(layout, dtype);
+            }
+        };
+        let func = dev.get_or_load_func(kernel_name, kernels::CAST)?;
+        let slice = match out_dtype {
+            DType::BF16 => {
+                let out = unsafe { dev.alloc::<bf16>(el) }.w()?;
+                let params = (el, dims.len(), &ds, *inp, &out);
+                unsafe { func.launch(cfg, params) }.w()?;
+                CudaStorageSlice::BF16(out)
+            }
+            DType::F32 => {
+                let out = unsafe { dev.alloc::<f32>(el) }.w()?;
+                let params = (el, dims.len(), &ds, *inp, &out);
+                unsafe { func.launch(cfg, params) }.w()?;
+                CudaStorageSlice::F32(out)
+            }
+            _ => unreachable!(),
+        };
+        Ok(Self {
+            slice,
+            device: dev.clone(),
+        })
+    }
+}
+
 impl BackendStorage for CudaStorage {
     type Device = CudaDevice;
 
@@ -1312,6 +1422,12 @@ impl BackendStorage for CudaStorage {
                 let params = (el, dims.len(), &ds, *inp, &out);
                 unsafe { func.launch(cfg, params) }.w()?;
                 CudaStorageSlice::F64(out)
+            }
+            DType::F8E8M0 => {
+                Err(crate::Error::UnsupportedDTypeForOp(DType::F8E8M0, "to_dtype").bt())?
+            }
+            DType::F8E4M3 => {
+                Err(crate::Error::UnsupportedDTypeForOp(DType::F8E4M3, "to_dtype").bt())?
             }
         };
         Ok(Self {

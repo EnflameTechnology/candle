@@ -145,7 +145,9 @@ impl Tensor {
             arg.storage()
                 .copy_strided_src(&mut storage, offset, arg.layout())?;
         }
-        Ok(crate::tensor::from_storage(storage, shape, op, false))
+        Ok(crate::tensor::from_storage_with_dtype(
+            storage, shape, dtype, op, false,
+        ))
     }
 
     fn cat_contiguous<A: AsRef<Tensor>>(args: &[A], dim: usize) -> Result<Self> {
@@ -233,7 +235,9 @@ impl Tensor {
             )?;
             dst_o += d2;
         }
-        Ok(crate::tensor::from_storage(storage, shape, op, false))
+        Ok(crate::tensor::from_storage_with_dtype(
+            storage, shape, dtype, op, false,
+        ))
     }
 
     /// Set the values on `self` using values from `src`. The copy starts at the specified

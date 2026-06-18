@@ -1,4 +1,5 @@
 #include "cuda_utils.cuh"
+#include <cuda_fp8.h>
 #include<stdint.h>
 
 template <typename S, typename T>
@@ -208,3 +209,86 @@ CAST_OP(double, uint32_t, cast_f64_u32)
 CAST_OP(double, int64_t,  cast_f64_i64 )
 CAST_OP(double, float,    cast_f64_f32)
 CAST_OP(double, double,   cast_f64_f64)
+
+// F8_E8M0 (power-of-two exponent-only scale) to F32/BF16
+// Decode: value = 2^(byte - 127) = reinterpret(byte << 23) as float; 0xFF = NaN
+__device__ __forceinline__ float e8m0_to_f32(uint8_t v) {
+    return (v == 0xFF) ? __uint_as_float(0x7FC00000u) : __uint_as_float((unsigned int)v << 23);
+}
+
+extern "C" __global__ void cast_f8e8m0_f32(
+    const size_t numel, const size_t num_dims, const size_t *info,
+    const uint8_t *inp, float *out) {
+    const size_t *dims = info;
+    const size_t *strides = info + num_dims;
+    if (info == nullptr || is_contiguous(num_dims, dims, strides)) {
+        for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) {
+            out[i] = e8m0_to_f32(inp[i]);
+        }
+    } else {
+        for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) {
+            unsigned strided_i = get_strided_index(i, num_dims, dims, strides);
+            out[i] = e8m0_to_f32(inp[strided_i]);
+        }
+    }
+}
+
+#if __CUDA_ARCH__ >= 800
+extern "C" __global__ void cast_f8e8m0_bf16(
+    const size_t numel, const size_t num_dims, const size_t *info,
+    const uint8_t *inp, __nv_bfloat16 *out) {
+    const size_t *dims = info;
+    const size_t *strides = info + num_dims;
+    if (info == nullptr || is_contiguous(num_dims, dims, strides)) {
+        for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) {
+            out[i] = __float2bfloat16_rn(e8m0_to_f32(inp[i]));
+        }
+    } else {
+        for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) {
+            unsigned strided_i = get_strided_index(i, num_dims, dims, strides);
+            out[i] = __float2bfloat16_rn(e8m0_to_f32(inp[strided_i]));
+        }
+    }
+}
+#endif
+
+// F8_E4M3 to F32/BF16 using CUDA intrinsics
+extern "C" __global__ void cast_f8e4m3_f32(
+    const size_t numel, const size_t num_dims, const size_t *info,
+    const uint8_t *inp, float *out) {
+    const size_t *dims = info;
+    const size_t *strides = info + num_dims;
+    if (info == nullptr || is_contiguous(num_dims, dims, strides)) {
+        for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) {
+            __half_raw hr = __nv_cvt_fp8_to_halfraw(inp[i], __NV_E4M3);
+            out[i] = __half2float(*reinterpret_cast<const __half*>(&hr));
+        }
+    } else {
+        for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) {
+            unsigned strided_i = get_strided_index(i, num_dims, dims, strides);
+            __half_raw hr = __nv_cvt_fp8_to_halfraw(inp[strided_i], __NV_E4M3);
+            out[i] = __half2float(*reinterpret_cast<const __half*>(&hr));
+        }
+    }
+}
+
+#if __CUDA_ARCH__ >= 800
+extern "C" __global__ void cast_f8e4m3_bf16(
+    const size_t numel, const size_t num_dims, const size_t *info,
+    const uint8_t *inp, __nv_bfloat16 *out) {
+    const size_t *dims = info;
+    const size_t *strides = info + num_dims;
+    if (info == nullptr || is_contiguous(num_dims, dims, strides)) {
+        for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) {
+            __half_raw hr = __nv_cvt_fp8_to_halfraw(inp[i], __NV_E4M3);
+            out[i] = __float2bfloat16_rn(__half2float(*reinterpret_cast<const __half*>(&hr)));
+        }
+    } else {
+        for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) {
+            unsigned strided_i = get_strided_index(i, num_dims, dims, strides);
+            __half_raw hr = __nv_cvt_fp8_to_halfraw(inp[strided_i], __NV_E4M3);
+            out[i] = __float2bfloat16_rn(__half2float(*reinterpret_cast<const __half*>(&hr)));
+        }
+    }
+}
+#endif

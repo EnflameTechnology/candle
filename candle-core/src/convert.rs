@@ -135,7 +135,7 @@ impl Tensor {
                     f.write_i64::<LittleEndian>(v)?
                 }
             }
-            DType::U8 => {
+            DType::U8 | DType::F8E8M0 | DType::F8E4M3 => {
                 let vs = vs.to_vec1::<u8>()?;
                 f.write_all(&vs)?;
             }

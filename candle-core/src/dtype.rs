@@ -20,6 +20,12 @@ pub enum DType {
     F32,
     // Floating-point using double precision (64 bits).
     F64,
+    // FP8 E8M0: power-of-two exponent-only format (MX/OCP block scaling).
+    // Stored as 1 byte per element. value = 2^(byte - 127).
+    F8E8M0,
+    // FP8 E4M3: 1 sign + 4 exponent (bias=7) + 3 mantissa bits.
+    // Stored as 1 byte per element. max value ±448, no infinity.
+    F8E4M3,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -44,6 +50,8 @@ impl std::str::FromStr for DType {
             "f16" => Ok(Self::F16),
             "f32" => Ok(Self::F32),
             "f64" => Ok(Self::F64),
+            "f8e8m0" => Ok(Self::F8E8M0),
+            "f8e4m3" => Ok(Self::F8E4M3),
             _ => Err(DTypeParseError(s.to_string())),
         }
     }
@@ -60,6 +68,8 @@ impl DType {
             Self::F16 => "f16",
             Self::F32 => "f32",
             Self::F64 => "f64",
+            Self::F8E8M0 => "f8e8m0",
+            Self::F8E4M3 => "f8e4m3",
         }
     }
 
@@ -73,21 +83,54 @@ impl DType {
             Self::F16 => 2,
             Self::F32 => 4,
             Self::F64 => 8,
+            Self::F8E8M0 => 1,
+            Self::F8E4M3 => 1,
         }
     }
 
     pub fn is_int(&self) -> bool {
         match self {
             Self::U8 | Self::U32 | Self::I64 => true,
-            Self::BF16 | Self::F16 | Self::F32 | Self::F64 => false,
+            Self::BF16 | Self::F16 | Self::F32 | Self::F64 | Self::F8E8M0 | Self::F8E4M3 => false,
         }
     }
 
     pub fn is_float(&self) -> bool {
         match self {
             Self::U8 | Self::U32 | Self::I64 => false,
-            Self::BF16 | Self::F16 | Self::F32 | Self::F64 => true,
+            Self::BF16 | Self::F16 | Self::F32 | Self::F64 | Self::F8E8M0 | Self::F8E4M3 => true,
         }
+    }
+}
+
+/// Decode an F8E8M0 byte to f32: value = 2^(byte - 127).
+pub fn f8e8m0_decode(v: u8) -> f32 {
+    if v == 0xFF {
+        f32::NAN
+    } else {
+        f32::from_bits((v as u32) << 23)
+    }
+}
+
+/// Decode an F8E4M3 byte to f32.
+/// Format: 1 sign + 4 exponent (bias=7) + 3 mantissa bits.
+/// NaN values: 0x7F and 0xFF (when all exponent bits and all mantissa bits are 1).
+pub fn f8e4m3_decode(v: u8) -> f32 {
+    let sign = (v >> 7) & 1;
+    let exp = (v >> 3) & 0xF;
+    let mant = v & 0x7;
+    // NaN: exponent=0xF, mantissa=0x7
+    if exp == 0xF && mant == 0x7 {
+        return f32::NAN;
+    }
+    let sign_f = if sign == 1 { -1.0f32 } else { 1.0f32 };
+    if exp == 0 {
+        // Subnormal: value = (-1)^sign * 2^(1-bias) * (0.mantissa) = (-1)^sign * 2^-6 * (mant/8)
+        sign_f * (mant as f32) * (1.0f32 / 64.0) * (1.0f32 / 8.0)
+    } else {
+        // Normal: value = (-1)^sign * 2^(exp-bias) * (1 + mantissa/8)
+        let exp_val = 2.0f32.powi(exp as i32 - 7);
+        sign_f * exp_val * (1.0 + mant as f32 / 8.0)
     }
 }
 
