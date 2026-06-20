@@ -68,11 +68,10 @@ extern "C" __global__ void FN_NAME( \
 #define BINARY_OP(TYPENAME, FN_NAME, FUNC) \
   BINARY_OP_OUT(TYPENAME, TYPENAME, FN_NAME, FUNC)
 
-// Vectorized bf16 binary op — 8 elements per float4 load via __nv_bfloat162 paired intrinsics.
-// VEC2_OP: paired intrinsic (e.g. __hadd2, __hmul2, __hsub2, __hdiv2)
-// SCALAR_FUNC: scalar fallback expression using x, y (e.g. x + y)
+// Vectorized bf16 binary op — 8 elements per float4 load, promotes to f32 for computation.
+// FLOAT_OP: expression using xf, yf (float) that produces the result (e.g. xf + yf)
 #if __CUDA_ARCH__ >= 800
-#define BINARY_OP_BF16_VEC(FN_NAME, VEC2_OP, SCALAR_FUNC) \
+#define BINARY_OP_BF16_VEC(FN_NAME, FLOAT_OP) \
 extern "C" __global__ void FN_NAME( \
     const size_t numel, \
     const size_t num_dims, \
@@ -95,23 +94,27 @@ extern "C" __global__ void FN_NAME( \
             for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < vec_numel; i += blockDim.x * gridDim.x) { \
                 float4 a = lhs4[i]; \
                 float4 b = rhs4[i]; \
-                __nv_bfloat162 *a2 = reinterpret_cast<__nv_bfloat162*>(&a); \
-                __nv_bfloat162 *b2 = reinterpret_cast<__nv_bfloat162*>(&b); \
+                __nv_bfloat16 *ap = reinterpret_cast<__nv_bfloat16*>(&a); \
+                __nv_bfloat16 *bp = reinterpret_cast<__nv_bfloat16*>(&b); \
                 _Pragma("unroll") \
-                for (int j = 0; j < 4; j++) { \
-                    a2[j] = VEC2_OP(a2[j], b2[j]); \
+                for (int j = 0; j < 8; j++) { \
+                    float xf = __bfloat162float(ap[j]); \
+                    float yf = __bfloat162float(bp[j]); \
+                    ap[j] = __float2bfloat16(FLOAT_OP); \
                 } \
                 out4[i] = a; \
             } \
             const size_t tail_start = vec_numel * 8; \
             for (unsigned int i = tail_start + blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) { \
-                __nv_bfloat16 x = lhs[i], y = rhs[i]; \
-                out[i] = SCALAR_FUNC; \
+                float xf = __bfloat162float(lhs[i]); \
+                float yf = __bfloat162float(rhs[i]); \
+                out[i] = __float2bfloat16(FLOAT_OP); \
             } \
         } else { \
             for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) { \
-                __nv_bfloat16 x = lhs[i], y = rhs[i]; \
-                out[i] = SCALAR_FUNC; \
+                float xf = __bfloat162float(lhs[i]); \
+                float yf = __bfloat162float(rhs[i]); \
+                out[i] = __float2bfloat16(FLOAT_OP); \
             } \
         } \
     } else if (lhs_cont) { \
@@ -120,8 +123,9 @@ extern "C" __global__ void FN_NAME( \
             for (int d = num_dims - 1; d >= 0; d--) { \
                 unsigned int i_dim = tmp_i % dims[d]; rhs_i += i_dim * rhs_strides[d]; tmp_i /= dims[d]; \
             } \
-            __nv_bfloat16 x = lhs[i], y = rhs[rhs_i]; \
-            out[i] = SCALAR_FUNC; \
+            float xf = __bfloat162float(lhs[i]); \
+            float yf = __bfloat162float(rhs[rhs_i]); \
+            out[i] = __float2bfloat16(FLOAT_OP); \
         } \
     } else if (rhs_cont) { \
         for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) { \
@@ -129,8 +133,9 @@ extern "C" __global__ void FN_NAME( \
             for (int d = num_dims - 1; d >= 0; d--) { \
                 unsigned int i_dim = tmp_i % dims[d]; lhs_i += i_dim * lhs_strides[d]; tmp_i /= dims[d]; \
             } \
-            __nv_bfloat16 x = lhs[lhs_i], y = rhs[i]; \
-            out[i] = SCALAR_FUNC; \
+            float xf = __bfloat162float(lhs[lhs_i]); \
+            float yf = __bfloat162float(rhs[i]); \
+            out[i] = __float2bfloat16(FLOAT_OP); \
         } \
     } else { \
         for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += blockDim.x * gridDim.x) { \
@@ -140,8 +145,9 @@ extern "C" __global__ void FN_NAME( \
                 lhs_i += i_dim * lhs_strides[d]; rhs_i += i_dim * rhs_strides[d]; \
                 tmp_i /= dims[d]; \
             } \
-            __nv_bfloat16 x = lhs[lhs_i], y = rhs[rhs_i]; \
-            out[i] = SCALAR_FUNC; \
+            float xf = __bfloat162float(lhs[lhs_i]); \
+            float yf = __bfloat162float(rhs[rhs_i]); \
+            out[i] = __float2bfloat16(FLOAT_OP); \
         } \
     } \
 }

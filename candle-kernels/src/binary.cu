@@ -2,10 +2,10 @@
 #include<stdint.h>
 
 #if __CUDA_ARCH__ >= 800
-BINARY_OP_BF16_VEC(badd_bf16, __hadd2, x + y)
-BINARY_OP_BF16_VEC(bmul_bf16, __hmul2, x * y)
-BINARY_OP(__nv_bfloat16, bdiv_bf16, x / y)
-BINARY_OP(__nv_bfloat16, bsub_bf16, x - y)
+BINARY_OP_BF16_VEC(badd_bf16, xf + yf)
+BINARY_OP_BF16_VEC(bmul_bf16, xf * yf)
+BINARY_OP_BF16_VEC(bdiv_bf16, xf / yf)
+BINARY_OP_BF16_VEC(bsub_bf16, xf - yf)
 BINARY_OP(__nv_bfloat16, bmaximum_bf16, maxg(x, y))
 BINARY_OP(__nv_bfloat16, bminimum_bf16, ming(x, y))
 BINARY_OP_OUT(__nv_bfloat16, uint8_t, eq_bf16, x == y)
