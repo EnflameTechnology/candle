@@ -180,11 +180,9 @@ impl OffloadBuffer {
                         self.len,
                         dev,
                     )?),
-                    DType::U8 | DType::F8E8M0 | DType::F8E4M3 => Storage::Cuda(storage_from_buffer(
-                        self.ptr_host as *mut u8,
-                        self.len,
-                        dev,
-                    )?),
+                    DType::U8 | DType::F8E8M0 | DType::F8E4M3 => Storage::Cuda(
+                        storage_from_buffer(self.ptr_host as *mut u8, self.len, dev)?,
+                    ),
                     DType::U32 => Storage::Cuda(storage_from_buffer(
                         self.ptr_host as *mut u32,
                         self.len,

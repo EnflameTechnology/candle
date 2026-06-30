@@ -323,7 +323,7 @@ impl GcuDevice {
         let elem_count = shape.elem_count();
         let stream = self.device.stream_inner().expect("unable to obtain stream");
         let slice = match dtype {
-            DType::U8 => {
+            DType::U8 | DType::F8E8M0 | DType::F8E4M3 => {
                 let data = self.alloc::<u8>(elem_count).w()?;
                 unsafe {
                     driv::topsMemsetD8Async(data.device_ptr(), v as u8, elem_count, stream)
@@ -537,7 +537,7 @@ impl BackendDevice for GcuDevice {
     fn zeros_impl(&self, shape: &Shape, dtype: DType, _sync_alloc: bool) -> Result<GcuStorage> {
         let elem_count = shape.elem_count();
         let slice = match dtype {
-            DType::U8 => {
+            DType::U8 | DType::F8E8M0 | DType::F8E4M3 => {
                 let data = self.alloc_zeros::<u8>(elem_count).w()?;
                 GcuStorageSlice::U8(data)
             }
@@ -595,7 +595,9 @@ impl BackendDevice for GcuDevice {
             | DType::I32
             | DType::I64
             | DType::F16
-            | DType::BF16 => Err(GcuError::UnsupportedDtype {
+            | DType::BF16
+            | DType::F8E8M0
+            | DType::F8E4M3 => Err(GcuError::UnsupportedDtype {
                 dtype,
                 op: "rand_uniform",
             })?,
@@ -640,7 +642,9 @@ impl BackendDevice for GcuDevice {
             | DType::I32
             | DType::I64
             | DType::F16
-            | DType::BF16 => Err(GcuError::UnsupportedDtype {
+            | DType::BF16
+            | DType::F8E8M0
+            | DType::F8E4M3 => Err(GcuError::UnsupportedDtype {
                 dtype,
                 op: "rand_normal",
             })?,
@@ -671,7 +675,7 @@ impl BackendDevice for GcuDevice {
     unsafe fn alloc_uninit(&self, shape: &Shape, dtype: DType) -> Result<Self::Storage> {
         let elem_count = shape.elem_count();
         let slice = match dtype {
-            DType::U8 => {
+            DType::U8 | DType::F8E8M0 | DType::F8E4M3 => {
                 let data = self.alloc::<u8>(elem_count).w()?;
                 GcuStorageSlice::U8(data)
             }
@@ -1914,7 +1918,7 @@ impl GcuStorage {
 
         let func = dev.get_or_load_func(&kernel_name, ubridge::CAST)?;
         let slice = match dtype {
-            DType::U8 => {
+            DType::U8 | DType::F8E8M0 | DType::F8E4M3 => {
                 let out = dev.device.alloc::<u8>(el).w()?;
                 let params = (el, *inp, out.device_ptr());
                 unsafe { func.launch(&cfg, params) }.w()?;

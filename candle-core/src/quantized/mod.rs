@@ -392,6 +392,8 @@ impl QTensor {
                 )
             }
             Device::Metal(_) => false,
+            #[cfg(feature = "gcu")]
+            Device::Gcu(_) => false,
         }
     }
 
@@ -490,6 +492,10 @@ impl QTensor {
                         QStorage::Cuda(storage)
                     }
                     Device::Cpu => unreachable!(),
+                    #[cfg(feature = "gcu")]
+                    Device::Gcu(_) => {
+                        crate::bail!("quantize_on_device not supported on GCU");
+                    }
                 };
                 Ok(Self { storage, shape })
             }
