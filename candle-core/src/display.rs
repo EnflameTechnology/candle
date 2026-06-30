@@ -66,7 +66,105 @@ impl std::fmt::Debug for Tensor {
             DType::F16 => self.fmt_dt::<f16>(f),
             DType::F32 => self.fmt_dt::<f32>(f),
             DType::F64 => self.fmt_dt::<f64>(f),
+            DType::F8E8M0 => self.fmt_f8e8m0(f),
+            DType::F8E4M3 => self.fmt_f8e4m3(f),
         }
+    }
+}
+
+impl Tensor {
+    fn fmt_f8e8m0(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let device_str = match self.device().location() {
+            crate::DeviceLocation::Cpu => "".to_owned(),
+            crate::DeviceLocation::Cuda { gpu_id } => {
+                format!(", cuda:{}", gpu_id)
+            }
+            crate::DeviceLocation::Metal { gpu_id } => {
+                format!(", metal:{}", gpu_id)
+            }
+        };
+
+        write!(f, "Tensor[")?;
+        match self.dims() {
+            [] => {
+                if let Ok(v) = self.to_scalar::<u8>() {
+                    write!(f, "{}", crate::f8e8m0_decode(v))?
+                }
+            }
+            [s] if *s < 10 => {
+                if let Ok(vs) = self.to_vec1::<u8>() {
+                    for (i, v) in vs.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{}", crate::f8e8m0_decode(*v))?
+                    }
+                }
+            }
+            dims => {
+                write!(f, "dims ")?;
+                for (i, d) in dims.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{d}")?;
+                }
+            }
+        }
+        write!(f, "; {}{}]", self.dtype().as_str(), device_str)
+    }
+
+    fn f8e4m3_as_f32(&self) -> Result<Tensor> {
+        let vs = self.flatten_all()?.to_vec1::<u8>()?;
+        let data: Vec<f32> = vs.iter().map(|&v| crate::f8e4m3_decode(v)).collect();
+        Tensor::from_vec(data, self.dims(), self.device())
+    }
+
+    fn fmt_f8e4m3(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let device_str = match self.device().location() {
+            crate::DeviceLocation::Cpu => "".to_owned(),
+            crate::DeviceLocation::Cuda { gpu_id } => {
+                format!(", cuda:{}", gpu_id)
+            }
+            crate::DeviceLocation::Metal { gpu_id } => {
+                format!(", metal:{}", gpu_id)
+            }
+        };
+
+        write!(f, "Tensor[")?;
+        match self.dims() {
+            [] => {
+                if let Ok(v) = self.to_scalar::<u8>() {
+                    write!(f, "{}", crate::f8e4m3_decode(v))?
+                }
+            }
+            [s] if *s < 10 => {
+                if let Ok(vs) = self.to_vec1::<u8>() {
+                    for (i, v) in vs.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{}", crate::f8e4m3_decode(*v))?
+                    }
+                }
+            }
+            dims => {
+                write!(f, "dims ")?;
+                for (i, d) in dims.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{d}")?;
+                }
+            }
+        }
+        write!(f, "; {}{}]", self.dtype().as_str(), device_str)
+    }
+
+    fn f8e8m0_as_f32(&self) -> Result<Tensor> {
+        let vs = self.flatten_all()?.to_vec1::<u8>()?;
+        let data: Vec<f32> = vs.iter().map(|&v| crate::f8e8m0_decode(v)).collect();
+        Tensor::from_vec(data, self.dims(), self.device())
     }
 }
 
@@ -513,6 +611,24 @@ impl std::fmt::Display for Tensor {
                     let max_w = tf.max_width(&to_display);
                     tf.fmt_tensor(self, 1, max_w, summarize, &po, f)?;
                     writeln!(f)?;
+                }
+            }
+            DType::F8E8M0 => {
+                if let Ok(decoded) = to_display.f8e8m0_as_f32() {
+                    if let Ok(tf) = FloatFormatter::<f32>::new(&decoded, &po) {
+                        let max_w = tf.max_width(&decoded);
+                        tf.fmt_tensor(&decoded, 1, max_w, summarize, &po, f)?;
+                        writeln!(f)?;
+                    }
+                }
+            }
+            DType::F8E4M3 => {
+                if let Ok(decoded) = to_display.f8e4m3_as_f32() {
+                    if let Ok(tf) = FloatFormatter::<f32>::new(&decoded, &po) {
+                        let max_w = tf.max_width(&decoded);
+                        tf.fmt_tensor(&decoded, 1, max_w, summarize, &po, f)?;
+                        writeln!(f)?;
+                    }
                 }
             }
         };

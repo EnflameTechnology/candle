@@ -9,8 +9,9 @@ const int BLOCK_SIZE = 1024;
 // but also expect a f32 output so that this can be used for normalization e.g.
 // in softmax.
 
-// Optimized reduce sum: contiguous fast path with vectorized loads + warp shuffle,
-// falls back to strided path for non-contiguous data.
+// Fast reduce sum kernel, this assumes that the dimensions to loop over are at
+// the end, each block is responsible for populating one value in the output
+// array. There are at most 1024 threads per block.
 template <typename T>
 __device__ void
 fast_sum(const size_t src_numel, const size_t el_to_sum_per_block,
@@ -18,48 +19,70 @@ fast_sum(const size_t src_numel, const size_t el_to_sum_per_block,
   const size_t *dims = info;
   const size_t *strides = info + num_dims;
 
+  __shared__ T shr[BLOCK_SIZE];
+  size_t tid = threadIdx.x;
+  size_t dst_id = blockIdx.x;
+
+  shr[tid] = 0;
+  // Elements summed in this block range from dst_id * el_to_sum_per_block
+  // to (dst_id + 1) * el_to_sum_per_block.
+  size_t start_idx = dst_id * el_to_sum_per_block;
+  size_t stop_idx = min(start_idx + el_to_sum_per_block, src_numel);
+  size_t idx = start_idx + tid;
+
+  while (idx < stop_idx) {
+    // TODO: Fast version for the contiguous case.
+    size_t strided_i = get_strided_index(idx, num_dims, dims, strides);
+    shr[tid] += src[strided_i];
+    idx += blockDim.x;
+  }
+
+  // Parallel reduction, see the slides:
+  // https://www.olcf.ornl.gov/wp-content/uploads/2019/12/05_Atomics_Reductions_Warp_Shuffle.pdf
+  // https://stackoverflow.com/questions/66078814/is-cuda-atomicadd-operation-faster-than-launch-another-kernel-when-we-do-reduce
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    __syncthreads();
+    if (tid < s)
+      shr[tid] += shr[tid + s];
+  }
+
+  if (tid == 0)
+    dst[dst_id] = shr[0];
+}
+
+#if __CUDA_ARCH__ >= 530
+__device__ void
+fast_sum_f16_acc(const size_t src_numel, const size_t el_to_sum_per_block,
+                 const size_t num_dims, const size_t *info,
+                 const __half *src, __half *dst) {
+  const size_t *dims = info;
+  const size_t *strides = info + num_dims;
+
   __shared__ float shr[BLOCK_SIZE];
   size_t tid = threadIdx.x;
   size_t dst_id = blockIdx.x;
 
+  shr[tid] = 0.0f;
   size_t start_idx = dst_id * el_to_sum_per_block;
   size_t stop_idx = min(start_idx + el_to_sum_per_block, src_numel);
+  size_t idx = start_idx + tid;
 
-  float local_sum = 0.0f;
-
-  if (is_contiguous(num_dims, dims, strides)) {
-    size_t idx = start_idx + tid;
-    while (idx < stop_idx) {
-      local_sum += static_cast<float>(src[idx]);
-      idx += blockDim.x;
-    }
-  } else {
-    size_t idx = start_idx + tid;
-    while (idx < stop_idx) {
-      size_t strided_i = get_strided_index(idx, num_dims, dims, strides);
-      local_sum += static_cast<float>(src[strided_i]);
-      idx += blockDim.x;
-    }
+  while (idx < stop_idx) {
+    size_t strided_i = get_strided_index(idx, num_dims, dims, strides);
+    shr[tid] += __half2float(src[strided_i]);
+    idx += blockDim.x;
   }
 
-  // Warp-level reduction first
-  for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-    local_sum += __shfl_xor_sync(0xffffffff, local_sum, offset);
-
-  int warp_id = tid / WARP_SIZE;
-  int lane_id = tid % WARP_SIZE;
-  if (lane_id == 0) shr[warp_id] = local_sum;
-  __syncthreads();
-
-  // Final reduction across warps
-  int num_warps = blockDim.x / WARP_SIZE;
-  if (tid < WARP_SIZE) {
-    local_sum = (tid < num_warps) ? shr[tid] : 0.0f;
-    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-      local_sum += __shfl_xor_sync(0xffffffff, local_sum, offset);
-    if (tid == 0) dst[dst_id] = static_cast<T>(local_sum);
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    __syncthreads();
+    if (tid < s)
+      shr[tid] += shr[tid + s];
   }
+
+  if (tid == 0)
+    dst[dst_id] = __float2half(shr[0]);
 }
+#endif
 
 // Specialized vectorized fast_sum for bf16: 8 elements per float4 load
 #if __CUDA_ARCH__ >= 800
@@ -78,18 +101,33 @@ fast_sum_bf16_vec(const size_t src_numel, const size_t el_to_sum_per_block,
   float local_sum = 0.0f;
 
   if (is_contiguous(num_dims, dims, strides)) {
-    const size_t vec_start = start_idx / 8;
+    // Round start up and stop down to float4-aligned boundaries
+    const size_t vec_start = (start_idx + 7) / 8;
     const size_t vec_stop = stop_idx / 8;
-    const float4 *src4 = reinterpret_cast<const float4*>(src);
 
-    for (size_t vi = vec_start + tid; vi < vec_stop; vi += blockDim.x) {
-      float4 v = src4[vi];
-      const __nv_bfloat16 *bp = reinterpret_cast<const __nv_bfloat16*>(&v);
-      #pragma unroll
-      for (int j = 0; j < 8; j++) {
-        local_sum += __bfloat162float(bp[j]);
+    // Scalar head: elements before the first aligned float4
+    size_t head_end = min(vec_start * 8, stop_idx);
+    for (size_t i = start_idx + tid; i < head_end; i += blockDim.x) {
+      local_sum += __bfloat162float(src[i]);
+    }
+
+    if (vec_start < vec_stop && is_aligned_16(src)) {
+      const float4 *src4 = reinterpret_cast<const float4*>(src);
+      for (size_t vi = vec_start + tid; vi < vec_stop; vi += blockDim.x) {
+        float4 v = src4[vi];
+        const __nv_bfloat16 *bp = reinterpret_cast<const __nv_bfloat16*>(&v);
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+          local_sum += __bfloat162float(bp[j]);
+        }
+      }
+    } else {
+      for (size_t i = head_end + tid; i < vec_stop * 8; i += blockDim.x) {
+        local_sum += __bfloat162float(src[i]);
       }
     }
+
+    // Scalar tail: elements after the last aligned float4
     size_t tail_start = vec_stop * 8;
     for (size_t i = tail_start + tid; i < stop_idx; i += blockDim.x) {
       local_sum += __bfloat162float(src[i]);
@@ -255,11 +293,11 @@ __device__ void softmax(const T * x, T * dst, const int ncols) {
     const int block_size = blockDim.y;
     const int tid = threadIdx.y;
 
-    T max_val = -INFINITY;
+    ACC max_val = -INFINITY;
 
     for (int col = tid; col < ncols; col += block_size) {
         const int i = row*ncols + col;
-        max_val = maxg(max_val, x[i]);
+        max_val = maxg(max_val, static_cast<ACC>(x[i]));
     }
 
     // find the max value in the block
@@ -272,9 +310,8 @@ __device__ void softmax(const T * x, T * dst, const int ncols) {
 
     for (int col = tid; col < ncols; col += block_size) {
         const int i = row*ncols + col;
-        const T val = expg(x[i] - max_val);
-        tmp += static_cast<ACC>(val);
-        dst[i] = val;
+        const ACC val = expg(static_cast<ACC>(x[i]) - max_val);
+        tmp += val;
     }
 
     // sum up partial sums
@@ -287,7 +324,7 @@ __device__ void softmax(const T * x, T * dst, const int ncols) {
 
     for (int col = tid; col < ncols; col += block_size) {
         const int i = row*ncols + col;
-        dst[i] *= inv_tmp;
+        dst[i] = static_cast<T>(expg(static_cast<ACC>(x[i]) - max_val) * inv_tmp);
     }
 }
 
@@ -656,22 +693,20 @@ fast_sum_small_impl(const size_t src_numel, const size_t el_to_sum_per_block,
   size_t gid = blockIdx.x * blockDim.x + threadIdx.x;
   if (gid >= dst_el) return;
 
-  float sum = 0.0f;
+  T sum = 0;
 
   if (is_contiguous(num_dims, dims, strides)) {
     size_t start = gid * el_to_sum_per_block;
     for (size_t i = 0; i < el_to_sum_per_block; ++i) {
-      sum += static_cast<float>(src[start + i]);
+      sum += src[start + i];
     }
   } else {
-    size_t base_linear = gid * el_to_sum_per_block;
-    size_t base_strided = get_strided_index(base_linear, num_dims, dims, strides);
-    size_t sum_stride = strides[num_dims - 1];
     for (size_t i = 0; i < el_to_sum_per_block; ++i) {
-      sum += static_cast<float>(src[base_strided + i * sum_stride]);
+      size_t strided_i = get_strided_index(gid * el_to_sum_per_block + i, num_dims, dims, strides);
+      sum += src[strided_i];
     }
   }
-  dst[gid] = static_cast<T>(sum);
+  dst[gid] = sum;
 }
 
 #if __CUDA_ARCH__ >= 800
@@ -693,15 +728,9 @@ extern "C" __global__ void fast_sum_small_bf16(
       sum += __bfloat162float(src[start + i]);
     }
   } else {
-    // Compute base address once via get_strided_index, then use the stride
-    // of the innermost (sum) dimension for subsequent elements.
-    // This avoids expensive integer division per element.
-    size_t base_linear = gid * el_to_sum_per_block;
-    size_t base_strided = get_strided_index(base_linear, num_dims, dims, strides);
-    size_t sum_stride = strides[num_dims - 1];
-
     for (size_t i = 0; i < el_to_sum_per_block; ++i) {
-      sum += __bfloat162float(src[base_strided + i * sum_stride]);
+      size_t strided_i = get_strided_index(gid * el_to_sum_per_block + i, num_dims, dims, strides);
+      sum += __bfloat162float(src[strided_i]);
     }
   }
 
@@ -723,12 +752,53 @@ extern "C" __global__ void fast_sum_small_f64(
   fast_sum_small_impl(src_numel, el_to_sum_per_block, num_dims, info, src, dst);
 }
 
+extern "C" __global__ void fast_sum_small_u32(
+    const size_t src_numel, const size_t el_to_sum_per_block,
+    const size_t num_dims, const size_t *info, const uint32_t *src,
+    uint32_t *dst) {
+  fast_sum_small_impl(src_numel, el_to_sum_per_block, num_dims, info, src, dst);
+}
+
+extern "C" __global__ void fast_sum_small_i64(
+    const size_t src_numel, const size_t el_to_sum_per_block,
+    const size_t num_dims, const size_t *info, const int64_t *src,
+    int64_t *dst) {
+  fast_sum_small_impl(src_numel, el_to_sum_per_block, num_dims, info, src, dst);
+}
+
+extern "C" __global__ void fast_sum_small_u8(
+    const size_t src_numel, const size_t el_to_sum_per_block,
+    const size_t num_dims, const size_t *info, const uint8_t *src,
+    uint8_t *dst) {
+  fast_sum_small_impl(src_numel, el_to_sum_per_block, num_dims, info, src, dst);
+}
+
 #if __CUDA_ARCH__ >= 530
 extern "C" __global__ void fast_sum_small_f16(
     const size_t src_numel, const size_t el_to_sum_per_block,
     const size_t num_dims, const size_t *info, const __half *src,
     __half *dst) {
-  fast_sum_small_impl(src_numel, el_to_sum_per_block, num_dims, info, src, dst);
+  const size_t *dims = info;
+  const size_t *strides = info + num_dims;
+  const size_t dst_el = src_numel / el_to_sum_per_block;
+  size_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gid >= dst_el) return;
+
+  float sum = 0.0f;
+
+  if (is_contiguous(num_dims, dims, strides)) {
+    size_t start = gid * el_to_sum_per_block;
+    for (size_t i = 0; i < el_to_sum_per_block; ++i) {
+      sum += __half2float(src[start + i]);
+    }
+  } else {
+    for (size_t i = 0; i < el_to_sum_per_block; ++i) {
+      size_t strided_i = get_strided_index(gid * el_to_sum_per_block + i, num_dims, dims, strides);
+      sum += __half2float(src[strided_i]);
+    }
+  }
+
+  dst[gid] = __float2half(sum);
 }
 #endif
 
@@ -778,7 +848,36 @@ RMSNORM_OP(__half, rmsnorm_f16)
 LAYERNORM_OP(__half, layernorm_f16)
 ROPE_OP(__half, rope_f16, rope_i_f16, rope_thd_f16)
 SUM_OP(__half, sum_f16)
-FAST_OP(__half, fast_min_f16, fast_max_f16, fast_argmin_f16, fast_argmax_f16, fast_sum_f16)
+extern "C" __global__ void fast_argmin_f16(
+    const size_t src_numel, const size_t el_to_sum_per_block,
+    const size_t num_dims, const size_t *info, const __half *src,
+    uint32_t *dst) {
+  fast_argmin(src_numel, el_to_sum_per_block, num_dims, info, src, dst);
+}
+extern "C" __global__ void fast_argmax_f16(
+    const size_t src_numel, const size_t el_to_sum_per_block,
+    const size_t num_dims, const size_t *info, const __half *src,
+    uint32_t *dst) {
+  fast_argmax(src_numel, el_to_sum_per_block, num_dims, info, src, dst);
+}
+extern "C" __global__ void fast_min_f16(
+    const size_t src_numel, const size_t el_to_sum_per_block,
+    const size_t num_dims, const size_t *info, const __half *src,
+    __half *dst) {
+  fast_min(src_numel, el_to_sum_per_block, num_dims, info, src, dst);
+}
+extern "C" __global__ void fast_max_f16(
+    const size_t src_numel, const size_t el_to_sum_per_block,
+    const size_t num_dims, const size_t *info, const __half *src,
+    __half *dst) {
+  fast_max(src_numel, el_to_sum_per_block, num_dims, info, src, dst);
+}
+extern "C" __global__ void fast_sum_f16(
+    const size_t src_numel, const size_t el_to_sum_per_block,
+    const size_t num_dims, const size_t *info, const __half *src,
+    __half *dst) {
+  fast_sum_f16_acc(src_numel, el_to_sum_per_block, num_dims, info, src, dst);
+}
 #endif
 
 SUM_OP(float, sum_f32)
@@ -805,13 +904,26 @@ extern "C" __global__ void fast_sum_f32(
   size_t stop_idx = min(start_idx + el_to_sum_per_block, src_numel);
   float local_sum = 0.0f;
   if (is_contiguous(num_dims, dims, strides)) {
-    const size_t vec_start = start_idx / 4;
+    const size_t vec_start = (start_idx + 3) / 4;
     const size_t vec_stop = stop_idx / 4;
-    const float4 *src4 = reinterpret_cast<const float4*>(src);
-    for (size_t vi = vec_start + tid; vi < vec_stop; vi += blockDim.x) {
-      float4 v = src4[vi];
-      local_sum += v.x + v.y + v.z + v.w;
+
+    // Scalar head
+    size_t head_end = min(vec_start * 4, stop_idx);
+    for (size_t i = start_idx + tid; i < head_end; i += blockDim.x)
+      local_sum += src[i];
+
+    if (vec_start < vec_stop && is_aligned_16(src)) {
+      const float4 *src4 = reinterpret_cast<const float4*>(src);
+      for (size_t vi = vec_start + tid; vi < vec_stop; vi += blockDim.x) {
+        float4 v = src4[vi];
+        local_sum += v.x + v.y + v.z + v.w;
+      }
+    } else {
+      for (size_t i = head_end + tid; i < vec_stop * 4; i += blockDim.x)
+        local_sum += src[i];
     }
+
+    // Scalar tail
     size_t tail_start = vec_stop * 4;
     for (size_t i = tail_start + tid; i < stop_idx; i += blockDim.x)
       local_sum += src[i];

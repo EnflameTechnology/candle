@@ -143,6 +143,7 @@ impl QStorage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(non_camel_case_types)]
 pub enum GgmlDType {
     F32,
     F16,
@@ -159,6 +160,10 @@ pub enum GgmlDType {
     Q5K,
     Q6K,
     Q8K,
+    IQ2_XXS,
+    IQ2_XS,
+    IQ3_XXS,
+    IQ4_XS,
 }
 
 impl GgmlDType {
@@ -178,6 +183,10 @@ impl GgmlDType {
             13 => Self::Q5K,
             14 => Self::Q6K,
             15 => Self::Q8K,
+            16 => Self::IQ2_XXS,
+            17 => Self::IQ2_XS,
+            18 => Self::IQ3_XXS,
+            23 => Self::IQ4_XS,
             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
             30 => Self::BF16,
             _ => crate::bail!("unknown dtype for tensor {u}"),
@@ -201,6 +210,10 @@ impl GgmlDType {
             Self::Q5K => 13,
             Self::Q6K => 14,
             Self::Q8K => 15,
+            Self::IQ2_XXS => 16,
+            Self::IQ2_XS => 17,
+            Self::IQ3_XXS => 18,
+            Self::IQ4_XS => 23,
             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
             Self::BF16 => 30,
         }
@@ -223,6 +236,22 @@ impl GgmlDType {
             Self::Q5K => Box::new(vec![BlockQ5K::zeros(); elem_count / BlockQ5K::BLCK_SIZE]),
             Self::Q6K => Box::new(vec![BlockQ6K::zeros(); elem_count / BlockQ6K::BLCK_SIZE]),
             Self::Q8K => Box::new(vec![BlockQ8K::zeros(); elem_count / BlockQ8K::BLCK_SIZE]),
+            Self::IQ2_XXS => Box::new(vec![
+                BlockIQ2XXS::zeros();
+                elem_count / BlockIQ2XXS::BLCK_SIZE
+            ]),
+            Self::IQ2_XS => Box::new(vec![
+                BlockIQ2XS::zeros();
+                elem_count / BlockIQ2XS::BLCK_SIZE
+            ]),
+            Self::IQ3_XXS => Box::new(vec![
+                BlockIQ3XXS::zeros();
+                elem_count / BlockIQ3XXS::BLCK_SIZE
+            ]),
+            Self::IQ4_XS => Box::new(vec![
+                BlockIQ4XS::zeros();
+                elem_count / BlockIQ4XS::BLCK_SIZE
+            ]),
             Self::BF16 => Box::new(vec![bf16::zeros(); elem_count]),
         }
     }
@@ -245,6 +274,10 @@ impl GgmlDType {
             Self::Q5K => std::mem::size_of::<BlockQ5K>(),
             Self::Q6K => std::mem::size_of::<BlockQ6K>(),
             Self::Q8K => std::mem::size_of::<BlockQ8K>(),
+            Self::IQ2_XXS => std::mem::size_of::<BlockIQ2XXS>(),
+            Self::IQ2_XS => std::mem::size_of::<BlockIQ2XS>(),
+            Self::IQ3_XXS => std::mem::size_of::<BlockIQ3XXS>(),
+            Self::IQ4_XS => std::mem::size_of::<BlockIQ4XS>(),
         }
     }
 
@@ -259,7 +292,16 @@ impl GgmlDType {
             Self::Q5_1 => k_quants::QK5_1,
             Self::Q8_0 => k_quants::QK8_0,
             Self::Q8_1 => k_quants::QK8_1,
-            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => k_quants::QK_K,
+            Self::Q2K
+            | Self::Q3K
+            | Self::Q4K
+            | Self::Q5K
+            | Self::Q6K
+            | Self::Q8K
+            | Self::IQ2_XXS
+            | Self::IQ2_XS
+            | Self::IQ3_XXS
+            | Self::IQ4_XS => k_quants::QK_K,
         }
     }
 }
@@ -340,6 +382,19 @@ impl QTensor {
         Ok(Self { storage, shape })
     }
 
+    pub fn supports_native_quantize(device: &Device, dtype: GgmlDType) -> bool {
+        match device {
+            Device::Cpu => true,
+            Device::Cuda(_) => {
+                matches!(
+                    dtype,
+                    GgmlDType::Q4K | GgmlDType::Q6K | GgmlDType::Q8_0 | GgmlDType::Q8_1
+                )
+            }
+            Device::Metal(_) => false,
+        }
+    }
+
     pub fn quantize(src: &Tensor, dtype: GgmlDType) -> Result<Self> {
         let shape = src.shape();
         let block_size = dtype.block_size();
@@ -362,6 +417,87 @@ impl QTensor {
             storage,
             shape: shape.clone(),
         })
+    }
+
+    pub fn quantize_owned(src: Tensor, dtype: GgmlDType) -> Result<Self> {
+        let shape = src.shape().clone();
+        let block_size = dtype.block_size();
+        check_shape(&shape, block_size)?;
+        let elem_count = shape.elem_count();
+        if elem_count % block_size != 0 {
+            crate::bail!(
+                "tensor size ({shape:?}) is not divisible by block size {}",
+                block_size
+            )
+        }
+        let src = if src.dtype() != crate::DType::F32 {
+            let converted = src.to_dtype(crate::DType::F32)?;
+            drop(src);
+            converted
+        } else {
+            src
+        };
+        let src = {
+            let flattened = src.flatten_all()?;
+            drop(src);
+            flattened
+        };
+        let mut storage = src.device().qzeros(elem_count, dtype)?;
+        storage.quantize(&src.storage())?;
+        Ok(Self { storage, shape })
+    }
+
+    pub fn quantize_on_device(src: &Tensor, dtype: GgmlDType, device: &Device) -> Result<Self> {
+        let shape = src.shape().clone();
+        let block_size = dtype.block_size();
+        check_shape(&shape, block_size)?;
+        let elem_count = shape.elem_count();
+        if elem_count % block_size != 0 {
+            crate::bail!(
+                "tensor size ({shape:?}) is not divisible by block size {}",
+                block_size
+            )
+        }
+
+        match device {
+            Device::Metal(_) | Device::Cuda(_) => {
+                let cpu_src = src.to_device(&Device::Cpu)?;
+                let cpu_src = if cpu_src.dtype() != crate::DType::F32 {
+                    cpu_src.to_dtype(crate::DType::F32)?.flatten_all()?
+                } else {
+                    cpu_src.flatten_all()?
+                };
+                let mut cpu_storage = Device::Cpu.qzeros(elem_count, dtype)?;
+                cpu_storage.quantize(&cpu_src.storage())?;
+                let data = cpu_storage.data()?;
+                let storage = match device {
+                    Device::Metal(metal) => {
+                        let storage = metal::QMetalStorage::from_cpu_data(
+                            metal,
+                            elem_count,
+                            dtype,
+                            data.as_ref(),
+                        )?;
+                        QStorage::Metal(storage)
+                    }
+                    Device::Cuda(cuda) => {
+                        let storage = cuda::QCudaStorage::from_cpu_data(
+                            cuda,
+                            elem_count,
+                            dtype,
+                            data.as_ref(),
+                        )?;
+                        QStorage::Cuda(storage)
+                    }
+                    Device::Cpu => unreachable!(),
+                };
+                Ok(Self { storage, shape })
+            }
+            _ => {
+                let src = src.to_device(device)?;
+                Self::quantize(&src, dtype)
+            }
+        }
     }
 
     pub fn dtype(&self) -> GgmlDType {

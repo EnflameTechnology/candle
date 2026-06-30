@@ -168,6 +168,18 @@ pub(crate) fn from_storage<S: Into<Shape>>(
     is_variable: bool,
 ) -> Tensor {
     let dtype = storage.dtype();
+    from_storage_with_dtype(storage, shape, dtype, op, is_variable)
+}
+
+/// Like [`from_storage`] but allows the tensor dtype to differ from the storage dtype.
+/// Used for F8E8M0/F8E4M3 which are stored as U8 bytes.
+pub(crate) fn from_storage_with_dtype<S: Into<Shape>>(
+    storage: Storage,
+    shape: S,
+    dtype: DType,
+    op: BackpropOp,
+    is_variable: bool,
+) -> Tensor {
     let device = storage.device();
     let tensor_ = Tensor_ {
         id: TensorId::new(),
@@ -194,7 +206,7 @@ impl Tensor {
                 Storage::Gcu(storage) => storage.to_cpu_storage()?,
             };
             let buffer = match self.dtype() {
-                DType::U8 => Arc::new(OffloadBuffer::new(
+                DType::U8 | DType::F8E8M0 | DType::F8E4M3 => Arc::new(OffloadBuffer::new(
                     storage.as_slice::<u8>()?,
                     self.dtype(),
                     storage.device(),
@@ -2392,12 +2404,86 @@ impl Tensor {
     pub fn to_dtype(&self, dtype: DType) -> Result<Self> {
         if self.dtype() == dtype {
             Ok(self.clone())
+        } else if dtype == DType::F8E8M0 {
+            crate::bail!("conversion to F8E8M0 is not supported")
+        } else if dtype == DType::F8E4M3 {
+            crate::bail!("conversion to F8E4M3 is not supported")
+        } else if self.dtype() == DType::F8E8M0 {
+            self.f8e8m0_to_dtype(dtype)
+        } else if self.dtype() == DType::F8E4M3 {
+            self.f8e4m3_to_dtype(dtype)
         } else {
             let shape = self.shape();
             let storage = self.storage().to_dtype(self.layout(), dtype)?;
             let op = BackpropOp::new1(self, Op::ToDType);
             Ok(from_storage(storage, shape.clone(), op, false))
         }
+    }
+
+    fn f8e8m0_to_dtype(&self, dtype: DType) -> Result<Self> {
+        let shape = self.shape();
+        let op = BackpropOp::new1(self, Op::ToDType);
+        let storage = match dtype {
+            DType::F32 | DType::BF16 | DType::F16 => {
+                #[cfg(feature = "cuda")]
+                if let Storage::Cuda(s) = &*self.storage() {
+                    return Ok(from_storage(
+                        Storage::Cuda(s.to_dtype_from_f8e8m0(self.layout(), dtype)?),
+                        shape.clone(),
+                        op,
+                        false,
+                    ));
+                }
+                if let Storage::Cpu(s) = &*self.storage() {
+                    let s = match dtype {
+                        DType::F32 => crate::cpu_backend::f8e8m0_to_f32(s, self.layout())?,
+                        DType::BF16 => crate::cpu_backend::f8e8m0_to_bf16(s, self.layout())?,
+                        DType::F16 => crate::cpu_backend::f8e8m0_to_f16(s, self.layout())?,
+                        _ => unreachable!(),
+                    };
+                    Storage::Cpu(s)
+                } else {
+                    let cpu = self.to_device(&Device::Cpu)?;
+                    let decoded = cpu.f8e8m0_to_dtype(dtype)?;
+                    return decoded.to_device(self.device());
+                }
+            }
+            _ => self.storage().to_dtype(self.layout(), dtype)?,
+        };
+        Ok(from_storage(storage, shape.clone(), op, false))
+    }
+
+    fn f8e4m3_to_dtype(&self, dtype: DType) -> Result<Self> {
+        let shape = self.shape();
+        let op = BackpropOp::new1(self, Op::ToDType);
+        let storage = match dtype {
+            DType::F32 | DType::BF16 | DType::F16 => {
+                #[cfg(feature = "cuda")]
+                if let Storage::Cuda(s) = &*self.storage() {
+                    return Ok(from_storage(
+                        Storage::Cuda(s.to_dtype_from_f8e4m3(self.layout(), dtype)?),
+                        shape.clone(),
+                        op,
+                        false,
+                    ));
+                }
+                if let Storage::Cpu(s) = &*self.storage() {
+                    let s = match dtype {
+                        DType::F32 => crate::cpu_backend::f8e4m3_to_f32(s, self.layout())?,
+                        DType::BF16 => crate::cpu_backend::f8e4m3_to_bf16(s, self.layout())?,
+                        DType::F16 => crate::cpu_backend::f8e4m3_to_f16(s, self.layout())?,
+                        _ => unreachable!(),
+                    };
+                    Storage::Cpu(s)
+                } else {
+                    let cpu = self.to_device(&Device::Cpu)?;
+                    let decoded = cpu.f8e4m3_to_dtype(dtype)?;
+                    return decoded.to_device(self.device());
+                }
+            }
+            _ => self.storage().to_dtype(self.layout(), dtype)?,
+        };
+        Ok(from_storage(storage, shape.clone(), op, false))
     }
 
     /// Returns a tensor that is in row major order. This is the same as the original tensor if it

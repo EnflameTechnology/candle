@@ -141,7 +141,7 @@ impl OffloadBuffer {
                     DType::F32 => crate::Storage::Gcu(
                         dev.storage_from_buffer(self.ptr_host as *mut f32, self.len)?,
                     ),
-                    DType::U8 => crate::Storage::Gcu(
+                    DType::U8 | DType::F8E8M0 | DType::F8E4M3 => crate::Storage::Gcu(
                         dev.storage_from_buffer(self.ptr_host as *mut u8, self.len)?,
                     ),
                     DType::U32 => crate::Storage::Gcu(
@@ -180,7 +180,7 @@ impl OffloadBuffer {
                         self.len,
                         dev,
                     )?),
-                    DType::U8 => Storage::Cuda(storage_from_buffer(
+                    DType::U8 | DType::F8E8M0 | DType::F8E4M3 => Storage::Cuda(storage_from_buffer(
                         self.ptr_host as *mut u8,
                         self.len,
                         dev,

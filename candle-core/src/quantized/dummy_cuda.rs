@@ -12,6 +12,10 @@ impl QCudaStorage {
         Err(Error::NotCompiledWithCudaSupport)
     }
 
+    pub(crate) fn from_cpu_data(_: &CudaDevice, _: usize, _: GgmlDType, _: &[u8]) -> Result<Self> {
+        Err(Error::NotCompiledWithCudaSupport)
+    }
+
     pub fn dtype(&self) -> GgmlDType {
         self.dtype
     }

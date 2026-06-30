@@ -2244,6 +2244,7 @@ pub fn call_random_normal(
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(non_camel_case_types)]
 pub enum GgmlDType {
     Q4_0,
     Q4_1,
@@ -2260,6 +2261,10 @@ pub enum GgmlDType {
     F16,
     F32,
     BF16,
+    IQ2_XXS,
+    IQ2_XS,
+    IQ3_XXS,
+    IQ4_XS,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2331,6 +2336,12 @@ pub fn call_quantized_matmul_mv_t(
             let align = 4;
             (nth0, nth1, align)
         }
+        GgmlDType::IQ2_XXS | GgmlDType::IQ2_XS | GgmlDType::IQ3_XXS | GgmlDType::IQ4_XS => {
+            let nth0 = 2;
+            let nth1 = 32;
+            let align = 4;
+            (nth0, nth1, align)
+        }
         GgmlDType::Q6K => {
             let nth0 = 2;
             let nth1 = 32;
@@ -2377,6 +2388,10 @@ pub fn call_quantized_matmul_mv_t(
         GgmlDType::F16 => "kernel_mul_mv_f16_f32",
         GgmlDType::BF16 => "kernel_mul_mv_bf16_f32",
         GgmlDType::F32 => "kernel_mul_mv_f32_f32",
+        GgmlDType::IQ2_XXS => "kernel_mul_mv_iq2_xxs_f32",
+        GgmlDType::IQ2_XS => "kernel_mul_mv_iq2_xs_f32",
+        GgmlDType::IQ3_XXS => "kernel_mul_mv_iq3_xxs_f32",
+        GgmlDType::IQ4_XS => "kernel_mul_mv_iq4_xs_f32",
     };
 
     let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
@@ -2485,6 +2500,10 @@ pub fn call_quantized_matmul_mm_t(
         GgmlDType::F16 => "kernel_mul_mm_f16_f32",
         GgmlDType::BF16 => "kernel_mul_mm_bf16_f32",
         GgmlDType::F32 => "kernel_mul_mm_f32_f32",
+        GgmlDType::IQ2_XXS => "kernel_mul_mm_iq2_xxs_f32",
+        GgmlDType::IQ2_XS => "kernel_mul_mm_iq2_xs_f32",
+        GgmlDType::IQ3_XXS => "kernel_mul_mm_iq3_xxs_f32",
+        GgmlDType::IQ4_XS => "kernel_mul_mm_iq4_xs_f32",
     };
 
     let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;

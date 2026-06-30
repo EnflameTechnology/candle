@@ -115,6 +115,20 @@ impl CudaDevice {
                 unsafe { func.launch(cfg, params) }.w()?;
                 CudaStorageSlice::F64(data)
             }
+            DType::F8E8M0 => {
+                let data = unsafe { self.alloc::<u8>(elem_count) }.w()?;
+                let func = self.get_or_load_func("fill_u8", kernels::FILL)?;
+                let params = (&data, v as u8, elem_count);
+                unsafe { func.launch(cfg, params) }.w()?;
+                CudaStorageSlice::U8(data)
+            }
+            DType::F8E4M3 => {
+                let data = unsafe { self.alloc::<u8>(elem_count) }.w()?;
+                let func = self.get_or_load_func("fill_u8", kernels::FILL)?;
+                let params = (&data, v as u8, elem_count);
+                unsafe { func.launch(cfg, params) }.w()?;
+                CudaStorageSlice::U8(data)
+            }
         };
         Ok(CudaStorage {
             slice,
@@ -222,6 +236,14 @@ impl BackendDevice for CudaDevice {
                 let data = self.alloc_zeros::<f64>(elem_count, sync_alloc).w()?;
                 CudaStorageSlice::F64(data)
             }
+            DType::F8E8M0 => {
+                let data = self.alloc_zeros::<u8>(elem_count, sync_alloc).w()?;
+                CudaStorageSlice::U8(data)
+            }
+            DType::F8E4M3 => {
+                let data = self.alloc_zeros::<u8>(elem_count, sync_alloc).w()?;
+                CudaStorageSlice::U8(data)
+            }
         };
         Ok(CudaStorage {
             slice,
@@ -235,13 +257,17 @@ impl BackendDevice for CudaDevice {
         let slice = match dtype {
             // TODO: Add support for F16 and BF16 though this is likely to require some upstream
             // cudarc changes.
-            DType::U8 | DType::U32 | DType::I64 | DType::F16 | DType::BF16 => {
-                Err(CudaError::UnsupportedDtype {
-                    dtype,
-                    op: "rand_uniform",
-                })
-                .w()?
-            }
+            DType::U8
+            | DType::U32
+            | DType::I64
+            | DType::F16
+            | DType::BF16
+            | DType::F8E8M0
+            | DType::F8E4M3 => Err(CudaError::UnsupportedDtype {
+                dtype,
+                op: "rand_uniform",
+            })
+            .w()?,
             DType::F32 => {
                 let mut data = unsafe { self.alloc::<f32>(elem_count) }.w()?;
                 curand.0.fill_with_uniform(&mut data).w()?;
@@ -279,13 +305,17 @@ impl BackendDevice for CudaDevice {
             elem_count
         };
         let slice = match dtype {
-            DType::U8 | DType::U32 | DType::I64 | DType::F16 | DType::BF16 => {
-                Err(CudaError::UnsupportedDtype {
-                    dtype,
-                    op: "rand_normal",
-                })
-                .w()?
-            }
+            DType::U8
+            | DType::U32
+            | DType::I64
+            | DType::F16
+            | DType::BF16
+            | DType::F8E8M0
+            | DType::F8E4M3 => Err(CudaError::UnsupportedDtype {
+                dtype,
+                op: "rand_normal",
+            })
+            .w()?,
             DType::F32 => {
                 let mut data = unsafe { self.alloc::<f32>(elem_count_round) }.w()?;
                 curand
@@ -340,6 +370,14 @@ impl BackendDevice for CudaDevice {
             DType::F64 => {
                 let data = self.alloc::<f64>(elem_count).w()?;
                 CudaStorageSlice::F64(data)
+            }
+            DType::F8E8M0 => {
+                let data = self.alloc::<u8>(elem_count).w()?;
+                CudaStorageSlice::U8(data)
+            }
+            DType::F8E4M3 => {
+                let data = self.alloc::<u8>(elem_count).w()?;
+                CudaStorageSlice::U8(data)
             }
         };
         Ok(CudaStorage {

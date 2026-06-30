@@ -161,6 +161,10 @@ fn dequantize_f32(
         GgmlDType::Q5K => ("dequantize_block_q5_K_f32", true, 64, nb),
         GgmlDType::Q6K => ("dequantize_block_q6_K_f32", true, 64, nb),
         GgmlDType::Q8K => ("dequantize_block_q8_K_f32", true, 32, nb),
+        GgmlDType::IQ2_XXS => ("dequantize_block_iq2_xxs_f32", true, 32, nb),
+        GgmlDType::IQ2_XS => ("dequantize_block_iq2_xs_f32", true, 32, nb),
+        GgmlDType::IQ3_XXS => ("dequantize_block_iq3_xxs_f32", true, 32, nb),
+        GgmlDType::IQ4_XS => ("dequantize_block_iq4_xs_f32", true, 32, nb),
         _ => crate::bail!("unsupported dtype for dequantize {dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, candle_kernels::QUANTIZED)?;
@@ -218,6 +222,10 @@ fn dequantize_f16(
         GgmlDType::Q5K => ("dequantize_block_q5_K_f16", true, 64, nb),
         GgmlDType::Q6K => ("dequantize_block_q6_K_f16", true, 64, nb),
         GgmlDType::Q8K => ("dequantize_block_q8_K_f16", true, 32, nb),
+        GgmlDType::IQ2_XXS => ("dequantize_block_iq2_xxs_f16", true, 32, nb),
+        GgmlDType::IQ2_XS => ("dequantize_block_iq2_xs_f16", true, 32, nb),
+        GgmlDType::IQ3_XXS => ("dequantize_block_iq3_xxs_f16", true, 32, nb),
+        GgmlDType::IQ4_XS => ("dequantize_block_iq4_xs_f16", true, 32, nb),
         _ => crate::bail!("unsupported dtype for dequantize {dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, candle_kernels::QUANTIZED)?;
@@ -493,6 +501,35 @@ impl QCudaStorage {
         })
     }
 
+    pub(crate) fn from_cpu_data(
+        device: &CudaDevice,
+        elem_count: usize,
+        dtype: GgmlDType,
+        data: &[u8],
+    ) -> Result<Self> {
+        let size_in_bytes = ceil_div(elem_count, dtype.block_size()) * dtype.type_size();
+        if data.len() != size_in_bytes {
+            crate::bail!(
+                "invalid quantized cuda upload size: got {}, expected {}",
+                data.len(),
+                size_in_bytes
+            )
+        }
+        let padded_len = data.len() + MATRIX_ROW_PADDING * dtype.type_size() / dtype.block_size();
+        let mut inner = unsafe { device.alloc::<u8>(padded_len).w()? };
+        device
+            .htod_sync_copy_into(data, &mut inner.slice_mut(..data.len()))
+            .w()?;
+        Ok(QCudaStorage {
+            data: PaddedCudaSlice {
+                inner,
+                len: data.len(),
+            },
+            device: device.clone(),
+            dtype,
+        })
+    }
+
     pub fn dtype(&self) -> GgmlDType {
         self.dtype
     }
@@ -526,6 +563,10 @@ impl QCudaStorage {
                 | GgmlDType::Q5K
                 | GgmlDType::Q6K
                 | GgmlDType::Q8K
+                | GgmlDType::IQ2_XXS
+                | GgmlDType::IQ2_XS
+                | GgmlDType::IQ3_XXS
+                | GgmlDType::IQ4_XS
         );
         if fast_kernel {
             return dequantize_f32(&self.data, self.dtype, elem_count, self.device());
@@ -554,6 +595,14 @@ impl QCudaStorage {
             GgmlDType::Q5K => deq::<crate::quantized::BlockQ5K>(&buffer, block_len, &mut out)?,
             GgmlDType::Q6K => deq::<crate::quantized::BlockQ6K>(&buffer, block_len, &mut out)?,
             GgmlDType::Q8K => deq::<crate::quantized::BlockQ8K>(&buffer, block_len, &mut out)?,
+            GgmlDType::IQ2_XXS => {
+                deq::<crate::quantized::BlockIQ2XXS>(&buffer, block_len, &mut out)?
+            }
+            GgmlDType::IQ2_XS => deq::<crate::quantized::BlockIQ2XS>(&buffer, block_len, &mut out)?,
+            GgmlDType::IQ3_XXS => {
+                deq::<crate::quantized::BlockIQ3XXS>(&buffer, block_len, &mut out)?
+            }
+            GgmlDType::IQ4_XS => deq::<crate::quantized::BlockIQ4XS>(&buffer, block_len, &mut out)?,
         }
 
         self.device
@@ -610,6 +659,13 @@ impl QCudaStorage {
         storage: &CudaStorage,
         layout: &crate::Layout,
     ) -> Result<(CudaStorage, crate::Shape)> {
+        let is_iq = matches!(
+            self.dtype,
+            GgmlDType::IQ2_XXS | GgmlDType::IQ2_XS | GgmlDType::IQ3_XXS | GgmlDType::IQ4_XS
+        );
+        if is_iq {
+            return self.dequantize_matmul(self_shape, storage, layout);
+        }
         let max_bm = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
             1
         } else {
@@ -971,7 +1027,12 @@ impl QCudaStorage {
             crate::bail!("mismatch on matmul dim {self_shape:?} {:?}", layout.shape())
         }
 
-        let out = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
+        let use_dequant_path = FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed)
+            || matches!(
+                self.dtype,
+                GgmlDType::IQ2_XXS | GgmlDType::IQ2_XS | GgmlDType::IQ3_XXS | GgmlDType::IQ4_XS
+            );
+        let out = if use_dequant_path {
             let data_f32 = self.dequantize(n * k)?;
             let rhs_l = crate::Layout::new((k, n).into(), vec![1, k], 0).broadcast_as((b, k, n))?;
             storage.matmul(&data_f32, (b, m, n, k), layout, &rhs_l)?
