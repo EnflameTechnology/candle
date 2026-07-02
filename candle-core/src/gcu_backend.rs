@@ -2055,6 +2055,70 @@ impl BackendStorage for GcuStorage {
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, sum_dims: &[usize]) -> Result<Self> {
         let device = self.device().clone();
         let src_shape = layout.shape();
+
+        #[cfg(feature = "aten")]
+        if matches!(op, ReduceOp::Sum) && sum_dims.len() == 1 && layout.is_contiguous() {
+            use ubridge::device_ptr::DevicePtr;
+
+            let reduce_dim = sum_dims[0];
+            let src_dims = src_shape.dims();
+            let dtype_code: i32 = match &self.slice {
+                GcuStorageSlice::F16(_) => 4,
+                GcuStorageSlice::BF16(_) => 5,
+                GcuStorageSlice::F32(_) => 8,
+                _ => -1,
+            };
+
+            if dtype_code > 0 && src_dims.len() >= 2 && src_dims.len() <= 5 {
+                let stream = device
+                    .stream_inner()
+                    .expect("unable to obtain stream for aten sum");
+
+                let mut out_dims: Vec<usize> = Vec::new();
+                for (i, &d) in src_dims.iter().enumerate() {
+                    if i != reduce_dim {
+                        out_dims.push(d);
+                    }
+                }
+                if out_dims.is_empty() {
+                    out_dims.push(1);
+                }
+                let out_el: usize = out_dims.iter().product();
+                let input_dims_i64: Vec<i64> =
+                    src_dims.iter().map(|&d| d as i64).collect();
+
+                macro_rules! aten_sum {
+                    ($src_slice:expr, $ty:ty, $variant:ident) => {{
+                        let src = &$src_slice.slice(layout.start_offset()..);
+                        let out = device.alloc::<$ty>(out_el).w()?;
+                        let ret = unsafe {
+                            ubridge::ffi::topsaten_sum(
+                                out.device_ptr() as *mut std::ffi::c_void,
+                                src.device_ptr() as *const std::ffi::c_void,
+                                reduce_dim as i32,
+                                src_dims.len() as i32,
+                                input_dims_i64.as_ptr(),
+                                dtype_code,
+                                stream as *const std::ffi::c_void,
+                            )
+                        };
+                        if ret != 0 {
+                            crate::bail!("topsaten_sum failed with error code {ret}");
+                        }
+                        let slice = GcuStorageSlice::$variant(out);
+                        return Ok(Self { slice, device });
+                    }};
+                }
+
+                match &self.slice {
+                    GcuStorageSlice::F16(s) => aten_sum!(s, half::f16, F16),
+                    GcuStorageSlice::BF16(s) => aten_sum!(s, half::bf16, BF16),
+                    GcuStorageSlice::F32(s) => aten_sum!(s, f32, F32),
+                    _ => {}
+                }
+            }
+        }
+
         if sum_dims[0] != src_shape.dims().len() - 1 {
             //reduce at other dim (not last dim), requires transpose
             let src_stride = layout.stride();
@@ -2819,6 +2883,11 @@ impl BackendStorage for GcuStorage {
             .htod_copy_cached([dims, src_l.stride(), &dst_layout, origin_shape.dims()].concat())?;
         let mut cfg = dev.launch_cfg.clone();
 
+        const TRANSPOSE_MAX_BYTES: usize = 32 * 1024 * 1024;
+        if op_type == 1 && origin_el_count * self.dtype().size_in_bytes() > TRANSPOSE_MAX_BYTES {
+            op_type = 0;
+        }
+
         if (op_type == 1 && origin_el_count == el_count && dims.len() < 5)
             || (op_type == 2
                 && origin_el_count < el_count
@@ -2828,7 +2897,7 @@ impl BackendStorage for GcuStorage {
         } else {
             let shared_memory_required =
                 (origin_el_count + el_count) * self.dtype().size_in_bytes();
-            cfg.set_shared_memory(shared_memory_required as u32);
+            cfg.set_shared_memory(shared_memory_required.min(u32::MAX as usize) as u32);
         };
 
         match (&self.slice, &mut dst.slice) {
