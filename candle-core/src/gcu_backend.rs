@@ -1204,6 +1204,67 @@ impl<U: UnaryOpT> Map1 for U {
         let shape = layout.shape();
         let el_count = shape.elem_count();
         let src = &src.slice(layout.start_offset()..);
+
+        #[cfg(feature = "aten")]
+        {
+            let dtype_code: i32 = match T::DTYPE {
+                DType::F16 => 4,
+                DType::BF16 => 5,
+                DType::F32 => 8,
+                _ => -1,
+            };
+            let aten_fn: Option<
+                unsafe extern "C" fn(
+                    *mut std::ffi::c_void,
+                    *const std::ffi::c_void,
+                    i64,
+                    i32,
+                    *const i64,
+                    i32,
+                    *const std::ffi::c_void,
+                ) -> i32,
+            > = match U::KERNEL {
+                "uexp" => Some(ubridge::ffi::topsaten_exp),
+                "ulog" => Some(ubridge::ffi::topsaten_log),
+                "usin" => Some(ubridge::ffi::topsaten_sin),
+                "ucos" => Some(ubridge::ffi::topsaten_cos),
+                "utanh" => Some(ubridge::ffi::topsaten_tanh_op),
+                "usilu" => Some(ubridge::ffi::topsaten_silu),
+                "ugelu" => Some(ubridge::ffi::topsaten_gelu),
+                "usqrt" => Some(ubridge::ffi::topsaten_sqrt),
+                "uneg" => Some(ubridge::ffi::topsaten_neg),
+                "uabs" => Some(ubridge::ffi::topsaten_abs),
+                "urecip" => Some(ubridge::ffi::topsaten_reciprocal),
+                _ => None,
+            };
+            if let Some(ffi_fn) = aten_fn {
+                if dtype_code > 0 {
+                    let stream = dev
+                        .stream_inner()
+                        .expect("unable to obtain stream for aten unary");
+                    let dims = shape.dims();
+                    let ndim = dims.len() as i32;
+                    let shape_i64: Vec<i64> = dims.iter().map(|&d| d as i64).collect();
+                    let out = dev.alloc::<T>(el_count).w()?;
+                    let ret = unsafe {
+                        ffi_fn(
+                            out.device_ptr() as *mut std::ffi::c_void,
+                            src.device_ptr() as *const std::ffi::c_void,
+                            el_count as i64,
+                            ndim,
+                            shape_i64.as_ptr(),
+                            dtype_code,
+                            stream as *const std::ffi::c_void,
+                        )
+                    };
+                    if ret != 0 {
+                        crate::bail!("topsaten unary op {} failed with code {ret}", U::KERNEL);
+                    }
+                    return Ok(out);
+                }
+            }
+        }
+
         let func = dev.get_or_load_func(&kernel_name::<T>(U::KERNEL), ubridge::UNARY)?;
         let out = dev.alloc::<T>(el_count).w()?;
         let params = (el_count, src.device_ptr(), out.device_ptr());
@@ -1775,6 +1836,65 @@ impl<U: crate::op::BinaryOpT> Map2 for U {
         let elem_count = shape.elem_count();
         let lhs = &lhs.slice(lhs_l.start_offset()..);
         let rhs = &rhs.slice(rhs_l.start_offset()..);
+
+        #[cfg(feature = "aten")]
+        {
+            let dtype_code: i32 = match T::DTYPE {
+                DType::F16 => 4,
+                DType::BF16 => 5,
+                DType::F32 => 8,
+                _ => -1,
+            };
+            let aten_fn: Option<
+                unsafe extern "C" fn(
+                    *mut std::ffi::c_void,
+                    *const std::ffi::c_void,
+                    *const std::ffi::c_void,
+                    i64,
+                    i32,
+                    *const i64,
+                    i32,
+                    *const std::ffi::c_void,
+                ) -> i32,
+            > = match U::KERNEL {
+                "badd" => Some(ubridge::ffi::topsaten_add),
+                "bsub" => Some(ubridge::ffi::topsaten_sub),
+                "bmul" => Some(ubridge::ffi::topsaten_mul),
+                "bdiv" => Some(ubridge::ffi::topsaten_div),
+                _ => None,
+            };
+            if let Some(ffi_fn) = aten_fn {
+                if dtype_code > 0
+                    && lhs_l.is_contiguous()
+                    && rhs_l.is_contiguous()
+                    && lhs_l.shape() == rhs_l.shape()
+                {
+                    let stream = dev
+                        .stream_inner()
+                        .expect("unable to obtain stream for aten binary");
+                    let ndim = dims.len() as i32;
+                    let shape_i64: Vec<i64> = dims.iter().map(|&d| d as i64).collect();
+                    let out = dev.alloc::<T>(elem_count).w()?;
+                    let ret = unsafe {
+                        ffi_fn(
+                            out.device_ptr() as *mut std::ffi::c_void,
+                            lhs.device_ptr() as *const std::ffi::c_void,
+                            rhs.device_ptr() as *const std::ffi::c_void,
+                            elem_count as i64,
+                            ndim,
+                            shape_i64.as_ptr(),
+                            dtype_code,
+                            stream as *const std::ffi::c_void,
+                        )
+                    };
+                    if ret != 0 {
+                        crate::bail!("topsaten binary op {} failed with code {ret}", U::KERNEL);
+                    }
+                    return Ok(out);
+                }
+            }
+        }
+
         let out = dev.alloc::<T>(elem_count).w()?;
         let dims_and_strides =
             dev.htod_copy_cached([dims, lhs_l.stride(), rhs_l.stride()].concat())?;
@@ -2057,7 +2177,7 @@ impl BackendStorage for GcuStorage {
         let src_shape = layout.shape();
 
         #[cfg(feature = "aten")]
-        if matches!(op, ReduceOp::Sum) && sum_dims.len() == 1 && layout.is_contiguous() {
+        if matches!(op, ReduceOp::Sum) && sum_dims.len() == 1 {
             use ubridge::device_ptr::DevicePtr;
 
             let reduce_dim = sum_dims[0];
@@ -2069,7 +2189,7 @@ impl BackendStorage for GcuStorage {
                 _ => -1,
             };
 
-            if dtype_code > 0 && src_dims.len() >= 2 && src_dims.len() <= 5 {
+            if dtype_code > 0 && src_dims.len() >= 1 {
                 let stream = device
                     .stream_inner()
                     .expect("unable to obtain stream for aten sum");
@@ -2084,8 +2204,7 @@ impl BackendStorage for GcuStorage {
                     out_dims.push(1);
                 }
                 let out_el: usize = out_dims.iter().product();
-                let input_dims_i64: Vec<i64> =
-                    src_dims.iter().map(|&d| d as i64).collect();
+                let input_dims_i64: Vec<i64> = src_dims.iter().map(|&d| d as i64).collect();
 
                 macro_rules! aten_sum {
                     ($src_slice:expr, $ty:ty, $variant:ident) => {{
@@ -2110,11 +2229,24 @@ impl BackendStorage for GcuStorage {
                     }};
                 }
 
-                match &self.slice {
-                    GcuStorageSlice::F16(s) => aten_sum!(s, half::f16, F16),
-                    GcuStorageSlice::BF16(s) => aten_sum!(s, half::bf16, BF16),
-                    GcuStorageSlice::F32(s) => aten_sum!(s, f32, F32),
-                    _ => {}
+                if layout.is_contiguous() {
+                    match &self.slice {
+                        GcuStorageSlice::F16(s) => aten_sum!(s, half::f16, F16),
+                        GcuStorageSlice::BF16(s) => aten_sum!(s, half::bf16, BF16),
+                        GcuStorageSlice::F32(s) => aten_sum!(s, f32, F32),
+                        _ => {}
+                    }
+                } else {
+                    let contig_layout = Layout::contiguous(src_shape);
+                    let mut contig_storage =
+                        unsafe { device.alloc_uninit(src_shape, self.dtype())? };
+                    self.copy_strided_src(&mut contig_storage, 0, layout)?;
+                    match &contig_storage.slice {
+                        GcuStorageSlice::F16(s) => aten_sum!(s, half::f16, F16),
+                        GcuStorageSlice::BF16(s) => aten_sum!(s, half::bf16, BF16),
+                        GcuStorageSlice::F32(s) => aten_sum!(s, f32, F32),
+                        _ => {}
+                    }
                 }
             }
         }
@@ -3114,6 +3246,87 @@ impl crate::CustomOp3 for Rope {
             crate::Storage::Gcu(p) => p,
             _ => panic!("positions must be a gcu tensor"),
         };
+
+        #[cfg(feature = "aten")]
+        {
+            use ubridge::device_ptr::DevicePtr;
+            let qk_dtype_code: i32 = match &query.slice {
+                GcuStorageSlice::F16(_) => 4,
+                GcuStorageSlice::BF16(_) => 5,
+                GcuStorageSlice::F32(_) => 8,
+                _ => -1,
+            };
+            let cache_dtype_code: i32 = match &cos_sin.slice {
+                GcuStorageSlice::F16(_) => 4,
+                GcuStorageSlice::BF16(_) => 5,
+                GcuStorageSlice::F32(_) => 8,
+                _ => -1,
+            };
+            if qk_dtype_code > 0 && cache_dtype_code > 0 {
+                let stream = dev
+                    .stream_inner()
+                    .expect("unable to obtain stream for aten rope");
+
+                let pos_ptr = match &positions.slice {
+                    GcuStorageSlice::I64(p) => p.device_ptr() as *const std::ffi::c_void,
+                    _ => panic!("positions must be I64"),
+                };
+                let (q_ptr, k_ptr) = match (&query.slice, &key.slice) {
+                    (GcuStorageSlice::BF16(q), GcuStorageSlice::BF16(k)) => (
+                        q.device_ptr() as *mut std::ffi::c_void,
+                        k.device_ptr() as *mut std::ffi::c_void,
+                    ),
+                    (GcuStorageSlice::F32(q), GcuStorageSlice::F32(k)) => (
+                        q.device_ptr() as *mut std::ffi::c_void,
+                        k.device_ptr() as *mut std::ffi::c_void,
+                    ),
+                    (GcuStorageSlice::F16(q), GcuStorageSlice::F16(k)) => (
+                        q.device_ptr() as *mut std::ffi::c_void,
+                        k.device_ptr() as *mut std::ffi::c_void,
+                    ),
+                    _ => panic!("dtype mismatch in rope op"),
+                };
+                let cs_ptr = match &cos_sin.slice {
+                    GcuStorageSlice::F32(c) => c.device_ptr() as *const std::ffi::c_void,
+                    GcuStorageSlice::BF16(c) => c.device_ptr() as *const std::ffi::c_void,
+                    GcuStorageSlice::F16(c) => c.device_ptr() as *const std::ffi::c_void,
+                    _ => panic!("dtype mismatch in rope cos_sin"),
+                };
+
+                let rot_dim = self.cos_sin_stride;
+
+                let ret = unsafe {
+                    ubridge::ffi::topsaten_rotary_embedding(
+                        q_ptr,
+                        k_ptr,
+                        pos_ptr,
+                        cs_ptr,
+                        self.num_tokens,
+                        self.q_head_size,
+                        self.k_head_size,
+                        self.hidden_size,
+                        rot_dim,
+                        self.cos_sin_length,
+                        self.gpt_neox,
+                        qk_dtype_code,
+                        cache_dtype_code,
+                        stream as *const std::ffi::c_void,
+                    )
+                };
+                if ret != 0 {
+                    crate::bail!("topsaten_rotary_embedding failed with error code {ret}");
+                }
+
+                let device = dev.clone();
+                return Ok((
+                    GcuStorage {
+                        slice: query.slice.to_owned(),
+                        device,
+                    },
+                    shape.to_owned(),
+                ));
+            }
+        }
 
         match (&query.slice, &key.slice, &positions.slice) {
             (

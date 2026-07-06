@@ -2365,6 +2365,64 @@ fn topk_func<
     let rank = input_l.dims().len();
     assert!(rank <= 3);
 
+    #[cfg(feature = "aten")]
+    if rank == 2 && input_l.is_contiguous() {
+        use candle::gcu_backend::ubridge;
+        use candle::gcu_backend::GcuStorageSlice;
+
+        let n_rows = shape.dims()[0] as i32;
+        let n_cols = shape.dims()[1] as i32;
+        let dtype_code: i32 = match input.dtype() {
+            DType::F16 => 4,
+            DType::BF16 => 5,
+            DType::F32 => 8,
+            _ => -1,
+        };
+
+        if dtype_code > 0 {
+            let out_values = dev.alloc::<T>(shape.dims()[0] * k).w()?;
+            let out_indices = dev.alloc::<i64>(shape.dims()[0] * k).w()?;
+
+            let input_ptr = match &value.slice {
+                GcuStorageSlice::F16(s) => {
+                    s.slice(input_l.start_offset()..).device_ptr() as *mut std::ffi::c_void
+                }
+                GcuStorageSlice::BF16(s) => {
+                    s.slice(input_l.start_offset()..).device_ptr() as *mut std::ffi::c_void
+                }
+                GcuStorageSlice::F32(s) => {
+                    s.slice(input_l.start_offset()..).device_ptr() as *mut std::ffi::c_void
+                }
+                _ => unreachable!(),
+            };
+
+            let ret = unsafe {
+                ubridge::ffi::topsaten_topk(
+                    out_values.device_ptr() as *mut std::ffi::c_void,
+                    out_indices.device_ptr() as *mut std::ffi::c_void,
+                    input_ptr,
+                    n_rows,
+                    n_cols,
+                    k as i32,
+                    1, // is_largest
+                    1, // is_sorted
+                    dtype_code,
+                    stream as *mut std::ffi::c_void,
+                )
+            };
+
+            if ret == 0 {
+                let s_out = candle::GcuStorage::wrap_gcu_slice(out_values, dev.clone());
+                let s_indices = candle::GcuStorage::wrap_gcu_slice(out_indices, dev.clone());
+                let out_dims = vec![shape.dims()[0], k];
+                return Ok((
+                    Tensor::from_storage(candle::Storage::Gcu(s_out), out_dims.clone())?,
+                    Tensor::from_storage(candle::Storage::Gcu(s_indices), out_dims)?,
+                ));
+            }
+        }
+    }
+
     {
         use candle::gcu_backend::ubridge::ffi::{topk_bf16, topk_f16, topk_f32};
 
