@@ -236,10 +236,11 @@ impl crate::CustomOp1 for ArgSort {
                     .expect("unable to obtain stream for aten sort");
 
                 macro_rules! aten_sort {
-                    ($inp:expr, $ty:ty, $variant:ident) => {{
+                    ($inp:expr, $ty:ty) => {{
                         let inp_s = &$inp.slice(layout.start_offset()..);
                         let sorted = dev.alloc::<$ty>(elem_count).w()?;
-                        let indices = dev.alloc::<i64>(elem_count).w()?;
+                        // topsatenSort requires index dtype i32/u32 (not i64)
+                        let indices = dev.alloc::<u32>(elem_count).w()?;
 
                         let ret = unsafe {
                             topsaten_sort(
@@ -258,25 +259,21 @@ impl crate::CustomOp1 for ArgSort {
                                 "topsaten_sort failed with code {ret} (rows={nrows}, cols={ncols})"
                             );
                         }
-                        // Return indices as I64 (caller handles dtype conversion)
-                        GcuStorageSlice::I64(indices)
+                        GcuStorageSlice::U32(indices)
                     }};
                 }
 
-                let indices_i64_slice = match &storage.slice {
-                    GcuStorageSlice::BF16(s) => aten_sort!(s, half::bf16, BF16),
-                    GcuStorageSlice::F16(s) => aten_sort!(s, half::f16, F16),
-                    GcuStorageSlice::F32(s) => aten_sort!(s, f32, F32),
+                let indices_slice = match &storage.slice {
+                    GcuStorageSlice::BF16(s) => aten_sort!(s, half::bf16),
+                    GcuStorageSlice::F16(s) => aten_sort!(s, half::f16),
+                    GcuStorageSlice::F32(s) => aten_sort!(s, f32),
                     _ => unreachable!(),
                 };
 
-                // Convert I64 indices to U32 via cast kernel
-                let i64_storage = crate::gcu_backend::GcuStorage {
-                    slice: indices_i64_slice,
+                let u32_storage = crate::gcu_backend::GcuStorage {
+                    slice: indices_slice,
                     device: dev.clone(),
                 };
-                let contig_layout = crate::Layout::contiguous(layout.shape());
-                let u32_storage = i64_storage.to_dtype(&contig_layout, crate::DType::U32)?;
                 return Ok((u32_storage, layout.shape().clone()));
             }
         }

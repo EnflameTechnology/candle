@@ -2381,7 +2381,8 @@ fn topk_func<
 
         if dtype_code > 0 {
             let out_values = dev.alloc::<T>(shape.dims()[0] * k).w()?;
-            let out_indices = dev.alloc::<i64>(shape.dims()[0] * k).w()?;
+            // topsatenTopk requires index dtype i32/u32 (not i64)
+            let out_indices = dev.alloc::<u32>(shape.dims()[0] * k).w()?;
 
             let input_ptr = match &value.slice {
                 GcuStorageSlice::F16(s) => {
