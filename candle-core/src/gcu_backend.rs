@@ -3010,25 +3010,116 @@ impl BackendStorage for GcuStorage {
                 dst_layout.swap(trans_dims[0], trans_dims[1]);
             }
         }
-        //dst shape, dst stride, dst layout, origin shape
-        let ds = dev
-            .htod_copy_cached([dims, src_l.stride(), &dst_layout, origin_shape.dims()].concat())?;
-        let mut cfg = dev.launch_cfg.clone();
 
         const TRANSPOSE_MAX_BYTES: usize = 32 * 1024 * 1024;
         if op_type == 1 && origin_el_count * self.dtype().size_in_bytes() > TRANSPOSE_MAX_BYTES {
             op_type = 0;
         }
 
-        if (op_type == 1 && origin_el_count == el_count && dims.len() < 5)
+        let use_dte_fast_path = (op_type == 1 && origin_el_count == el_count && dims.len() < 5)
             || (op_type == 2
                 && origin_el_count < el_count
                 && origin_shape.dims().len() <= dims.len())
-            || (op_type == 4 && origin_el_count > el_count)
-        {
-        } else {
-            let shared_memory_required =
-                (origin_el_count + el_count) * self.dtype().size_in_bytes();
+            || (op_type == 4 && origin_el_count > el_count);
+
+        // ucopy_* kernels allocate dynamic shared memory sized to the origin+dst
+        // tensors (up to ~60MB L2). Large non-contiguous copies (e.g. >8k-token
+        // prompts materializing strided views) exceed that and crash. With the
+        // `aten` feature, dispatch those to topsatenCopy instead.
+        // Threshold ~4MB matches the practical design point of the custom ucopy kernels.
+        const UCOPY_ATEN_THRESHOLD_BYTES: usize = 4 * 1024 * 1024;
+        let dtype_bytes = self.dtype().size_in_bytes();
+        let shared_memory_required = (origin_el_count + el_count) * dtype_bytes;
+        #[cfg(feature = "aten")]
+        let use_aten = !use_dte_fast_path
+            && !(src_l.is_contiguous() && origin_el_count == el_count)
+            && (shared_memory_required > UCOPY_ATEN_THRESHOLD_BYTES
+                || origin_el_count * dtype_bytes > UCOPY_ATEN_THRESHOLD_BYTES);
+
+        #[cfg(feature = "aten")]
+        if use_aten {
+            let dtype_code: i32 = match &self.slice {
+                GcuStorageSlice::I8(_) => 0,
+                GcuStorageSlice::U8(_) => 1,
+                GcuStorageSlice::F16(_) => 4,
+                GcuStorageSlice::BF16(_) => 5,
+                GcuStorageSlice::U32(_) => 7,
+                GcuStorageSlice::F32(_) => 8,
+                GcuStorageSlice::I64(_) => 11,
+                GcuStorageSlice::F64(_) => 13,
+                _ => -1,
+            };
+            if dtype_code >= 0 && dims.len() <= 5 && !dims.is_empty() {
+                let stream = dev
+                    .stream_inner()
+                    .expect("unable to obtain stream for aten copy");
+                let shape_i64: Vec<i64> = dims.iter().map(|&d| d as i64).collect();
+                let in_strides: Vec<i64> = src_l.stride().iter().map(|&s| s as i64).collect();
+                let mut out_strides = vec![1i64; dims.len()];
+                for i in (0..dims.len().saturating_sub(1)).rev() {
+                    out_strides[i] = out_strides[i + 1] * shape_i64[i + 1];
+                }
+                let ndim = dims.len() as i32;
+
+                macro_rules! aten_copy_arm {
+                    ($src:expr, $dst:expr) => {{
+                        let (src, mut dst) = slice_src_and_dst($src, src_l, $dst, dst_offset);
+                        let ret = unsafe {
+                            ubridge::ffi::topsaten_copy(
+                                dst.device_ptr() as *mut std::ffi::c_void,
+                                src.device_ptr() as *const std::ffi::c_void,
+                                ndim,
+                                shape_i64.as_ptr(),
+                                out_strides.as_ptr(),
+                                shape_i64.as_ptr(),
+                                in_strides.as_ptr(),
+                                dtype_code,
+                                stream as *const std::ffi::c_void,
+                            )
+                        };
+                        if ret != 0 {
+                            crate::bail!("topsaten_copy failed with code {ret}");
+                        }
+                    }};
+                }
+
+                match (&self.slice, &mut dst.slice) {
+                    (GcuStorageSlice::BF16(src), GcuStorageSlice::BF16(dst)) => {
+                        aten_copy_arm!(src, dst)
+                    }
+                    (GcuStorageSlice::F16(src), GcuStorageSlice::F16(dst)) => {
+                        aten_copy_arm!(src, dst)
+                    }
+                    (GcuStorageSlice::F32(src), GcuStorageSlice::F32(dst)) => {
+                        aten_copy_arm!(src, dst)
+                    }
+                    (GcuStorageSlice::U8(src), GcuStorageSlice::U8(dst)) => {
+                        aten_copy_arm!(src, dst)
+                    }
+                    (GcuStorageSlice::I8(src), GcuStorageSlice::I8(dst)) => {
+                        aten_copy_arm!(src, dst)
+                    }
+                    (GcuStorageSlice::U32(src), GcuStorageSlice::U32(dst)) => {
+                        aten_copy_arm!(src, dst)
+                    }
+                    (GcuStorageSlice::I64(src), GcuStorageSlice::I64(dst)) => {
+                        aten_copy_arm!(src, dst)
+                    }
+                    (GcuStorageSlice::F64(src), GcuStorageSlice::F64(dst)) => {
+                        aten_copy_arm!(src, dst)
+                    }
+                    _ => Err(GcuError::InternalError("dtype mismatch in copy_strided op"))?,
+                }
+                return Ok(());
+            }
+        }
+
+        //dst shape, dst stride, dst layout, origin shape
+        let ds = dev
+            .htod_copy_cached([dims, src_l.stride(), &dst_layout, origin_shape.dims()].concat())?;
+        let mut cfg = dev.launch_cfg.clone();
+
+        if !use_dte_fast_path {
             cfg.set_shared_memory(shared_memory_required.min(u32::MAX as usize) as u32);
         };
 
