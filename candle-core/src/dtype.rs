@@ -111,6 +111,18 @@ impl DType {
             Self::BF16 | Self::F16 | Self::F32 | Self::F64 | Self::F8E8M0 | Self::F8E4M3 => true,
         }
     }
+
+    /// Backend storage dtype used for byte-backed formats.
+    ///
+    /// `F8E4M3` / `F8E8M0` are stored as raw `U8` bytes on CUDA and Metal. Tensor
+    /// ops that allocate temporary buffers must use this so copies stay dtype-compatible
+    /// with safetensors-loaded FP8 weights (storage is U8, logical dtype is F8*).
+    pub fn storage_dtype(self) -> Self {
+        match self {
+            Self::F8E8M0 | Self::F8E4M3 => Self::U8,
+            other => other,
+        }
+    }
 }
 
 /// Decode an F8E8M0 byte to f32: value = 2^(byte - 127).

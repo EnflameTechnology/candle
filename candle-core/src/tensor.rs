@@ -324,7 +324,14 @@ impl Tensor {
         let none = BackpropOp::none();
         let shape = shape.into();
         let storage = device.ones(&shape, dtype)?;
-        Ok(from_storage(storage, shape, none, is_variable))
+        // Preserve logical dtype for U8-backed formats (F8E4M3/F8E8M0).
+        Ok(from_storage_with_dtype(
+            storage,
+            shape,
+            dtype,
+            none,
+            is_variable,
+        ))
     }
 
     /// Creates a new tensor filled with ones.
@@ -365,7 +372,14 @@ impl Tensor {
         let none = BackpropOp::none();
         let shape = shape.into();
         let storage = device.zeros(&shape, dtype, sync_alloc)?;
-        Ok(from_storage(storage, shape, none, is_variable))
+        // Preserve logical dtype for U8-backed formats (F8E4M3/F8E8M0).
+        Ok(from_storage_with_dtype(
+            storage,
+            shape,
+            dtype,
+            none,
+            is_variable,
+        ))
     }
 
     /// Creates a new tensor filled with zeros.
@@ -400,7 +414,8 @@ impl Tensor {
         let none = BackpropOp::none();
         let shape = shape.into();
         let storage = device.alloc_uninit(&shape, dtype)?;
-        Ok(from_storage(storage, shape, none, false))
+        // Preserve logical dtype for U8-backed formats (F8E4M3/F8E8M0).
+        Ok(from_storage_with_dtype(storage, shape, dtype, none, false))
     }
 
     /// Creates a new tensor filled with zeros with same shape, dtype, and device as the other
@@ -2497,7 +2512,14 @@ impl Tensor {
             self.storage()
                 .copy_strided_src(&mut storage, 0, self.layout())?;
             let op = BackpropOp::new1(self, Op::Copy);
-            Ok(from_storage(storage, shape.clone(), op, false))
+            // Preserve logical dtype when storage is U8-backed (F8E4M3/F8E8M0).
+            Ok(from_storage_with_dtype(
+                storage,
+                shape.clone(),
+                self.dtype(),
+                op,
+                false,
+            ))
         }
     }
 
@@ -2508,7 +2530,13 @@ impl Tensor {
         self.storage()
             .copy_strided_src(&mut storage, 0, self.layout())?;
         let op = BackpropOp::new1(self, Op::Copy);
-        Ok(from_storage(storage, shape.clone(), op, false))
+        Ok(from_storage_with_dtype(
+            storage,
+            shape.clone(),
+            self.dtype(),
+            op,
+            false,
+        ))
     }
 
     /// Create a variable based on the values currently stored in a tensor. The storage is always
@@ -2518,7 +2546,13 @@ impl Tensor {
         let mut storage = unsafe { self.device().alloc_uninit(&shape, self.dtype())? };
         self.storage()
             .copy_strided_src(&mut storage, 0, self.layout())?;
-        Ok(from_storage(storage, shape, BackpropOp::none(), true))
+        Ok(from_storage_with_dtype(
+            storage,
+            shape,
+            self.dtype(),
+            BackpropOp::none(),
+            true,
+        ))
     }
 
     /// Reshape returns a tensor with the target shape provided that the number of elements of the

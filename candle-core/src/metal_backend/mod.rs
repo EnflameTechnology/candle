@@ -1584,7 +1584,10 @@ impl BackendStorage for MetalStorage {
         src_o: usize,
         dst_o: usize,
     ) -> Result<()> {
-        if self.dtype() != dst.dtype() {
+        // F8E4M3/F8E8M0 are U8-backed; allow copies between logical FP8 and U8 storage.
+        let src_storage = self.dtype().storage_dtype();
+        let dst_storage = dst.dtype().storage_dtype();
+        if src_storage != dst_storage {
             crate::bail!(
                 "copy2d with inconsistent dtypes {:?} {:?}",
                 self.dtype(),
@@ -1596,9 +1599,9 @@ impl BackendStorage for MetalStorage {
             command_buffer.set_label("copy2d_contiguous");
             let blit = command_buffer.new_blit_command_encoder();
             blit.set_label("copy2d_contiguous");
-            let src_offset = (src_o * self.dtype.size_in_bytes()) as NSUInteger;
-            let length = (d1 * d2 * self.dtype.size_in_bytes()) as NSUInteger;
-            let dst_offset = (dst_o * dst.dtype().size_in_bytes()) as NSUInteger;
+            let src_offset = (src_o * src_storage.size_in_bytes()) as NSUInteger;
+            let length = (d1 * d2 * src_storage.size_in_bytes()) as NSUInteger;
+            let dst_offset = (dst_o * dst_storage.size_in_bytes()) as NSUInteger;
             blit.copy_from_buffer(&self.buffer, src_offset, dst.buffer(), dst_offset, length);
             blit.end_encoding();
         } else {
@@ -1606,7 +1609,7 @@ impl BackendStorage for MetalStorage {
             if el_count == 0 {
                 return Ok(());
             }
-            let kernel_name = match self.dtype {
+            let kernel_name = match src_storage {
                 DType::F32 => candle_metal_kernels::copy2d::FLOAT,
                 DType::F16 => candle_metal_kernels::copy2d::HALF,
                 DType::BF16 => candle_metal_kernels::copy2d::BFLOAT,
@@ -1626,8 +1629,8 @@ impl BackendStorage for MetalStorage {
                 d2,
                 src_s,
                 dst_s,
-                src_o * self.dtype.size_in_bytes(),
-                dst_o * self.dtype.size_in_bytes(),
+                src_o * src_storage.size_in_bytes(),
+                dst_o * src_storage.size_in_bytes(),
             )
             .map_err(MetalError::from)?;
             command_buffer.set_label("copy2d");
@@ -1637,13 +1640,15 @@ impl BackendStorage for MetalStorage {
 
     fn copy_strided_src(&self, dst: &mut Self, dst_offset: usize, src_l: &Layout) -> Result<()> {
         let command_buffer = self.device.command_buffer()?;
-        if src_l.is_contiguous() && self.dtype == dst.dtype() {
+        let src_storage = self.dtype.storage_dtype();
+        let dst_storage = dst.dtype.storage_dtype();
+        if src_l.is_contiguous() && src_storage == dst_storage {
             command_buffer.set_label("copy_contiguous");
             let blit = command_buffer.new_blit_command_encoder();
             blit.set_label("copy_contiguous");
-            let src_offset = (src_l.start_offset() * self.dtype.size_in_bytes()) as NSUInteger;
-            let length = (src_l.shape().elem_count() * self.dtype.size_in_bytes()) as NSUInteger;
-            let dst_offset = (dst_offset * dst.dtype().size_in_bytes()) as NSUInteger;
+            let src_offset = (src_l.start_offset() * src_storage.size_in_bytes()) as NSUInteger;
+            let length = (src_l.shape().elem_count() * src_storage.size_in_bytes()) as NSUInteger;
+            let dst_offset = (dst_offset * dst_storage.size_in_bytes()) as NSUInteger;
             blit.copy_from_buffer(&self.buffer, src_offset, dst.buffer(), dst_offset, length);
             blit.end_encoding();
         } else {
@@ -1652,7 +1657,14 @@ impl BackendStorage for MetalStorage {
             if el_count == 0 {
                 return Ok(());
             }
-            let kernel_name = match self.dtype {
+            if src_storage != dst_storage {
+                crate::bail!(
+                    "Metal copy_strided with inconsistent dtypes {:?} {:?}",
+                    self.dtype,
+                    dst.dtype
+                )
+            }
+            let kernel_name = match src_storage {
                 DType::F32 => candle_metal_kernels::unary::strided::copy::FLOAT,
                 DType::F16 => candle_metal_kernels::unary::strided::copy::HALF,
                 DType::BF16 => candle_metal_kernels::unary::strided::copy::BFLOAT,
@@ -1661,10 +1673,10 @@ impl BackendStorage for MetalStorage {
                 DType::U8 => candle_metal_kernels::unary::strided::copy::U8,
                 dtype => crate::bail!("Metal copy_strided {dtype:?} not implemented"),
             };
-            let src = buffer_o(&self.buffer, src_l, self.dtype);
+            let src = buffer_o(&self.buffer, src_l, src_storage);
             let dst = BufferOffset {
                 buffer: &dst.buffer,
-                offset_in_bytes: dst_offset * dst.dtype.size_in_bytes(),
+                offset_in_bytes: dst_offset * dst_storage.size_in_bytes(),
             };
             candle_metal_kernels::call_unary_strided(
                 &self.device.device,
@@ -1954,41 +1966,45 @@ impl BackendDevice for MetalDevice {
     }
 
     unsafe fn alloc_uninit(&self, shape: &Shape, dtype: DType) -> Result<MetalStorage> {
-        let buffer = self.new_buffer(shape.elem_count(), dtype, "alloc-uninit")?;
+        // Match CUDA: F8E4M3/F8E8M0 are allocated as U8-backed storage.
+        let storage_dtype = dtype.storage_dtype();
+        let buffer = self.new_buffer(shape.elem_count(), storage_dtype, "alloc-uninit")?;
         Ok(MetalStorage::new(
             buffer,
             self.clone(),
             shape.elem_count(),
-            dtype,
+            storage_dtype,
         ))
     }
 
     fn zeros_impl(&self, shape: &Shape, dtype: DType, sync_alloc: bool) -> Result<MetalStorage> {
-        let size = shape.elem_count() * dtype.size_in_bytes();
+        let storage_dtype = dtype.storage_dtype();
+        let size = shape.elem_count() * storage_dtype.size_in_bytes();
         let buffer = self.allocate_zeros(size, sync_alloc)?;
         Ok(MetalStorage::new(
             buffer,
             self.clone(),
             shape.elem_count(),
-            dtype,
+            storage_dtype,
         ))
     }
 
     fn ones_impl(&self, shape: &Shape, dtype: DType) -> Result<MetalStorage> {
-        let name = match dtype {
+        let storage_dtype = dtype.storage_dtype();
+        let name = match storage_dtype {
             DType::U8 => "fill_u8",
             DType::U32 => "fill_u32",
             DType::I64 => "fill_i64",
             DType::F16 => "fill_f16",
             DType::BF16 => "fill_bf16",
             DType::F32 => "fill_f32",
-            DType::F8E8M0 | DType::F8E4M3 => "fill_u8",
             DType::F64 => {
                 let cpu_storage = crate::cpu_backend::CpuDevice.ones_impl(shape, dtype)?;
                 return self.storage_from_cpu_storage(&cpu_storage);
             }
+            other => crate::bail!("Metal ones {other:?} not implemented"),
         };
-        let buffer = self.new_buffer(shape.elem_count(), dtype, "alloc-ones")?;
+        let buffer = self.new_buffer(shape.elem_count(), storage_dtype, "alloc-ones")?;
         let command_buffer = self.command_buffer()?;
         candle_metal_kernels::call_const_fill(
             &self.device,
@@ -2005,7 +2021,7 @@ impl BackendDevice for MetalDevice {
             buffer,
             self.clone(),
             shape.elem_count(),
-            dtype,
+            storage_dtype,
         ))
     }
 
