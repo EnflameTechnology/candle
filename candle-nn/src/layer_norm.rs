@@ -197,27 +197,16 @@ impl RmsNorm {
     pub fn into_inner(self) -> LayerNorm {
         self.0
     }
-
-    /// Faster variant of the forward kernel, this can only be used on contiguous tensors though.
-    pub fn forward_diff(&self, xs: &Tensor) -> Result<Tensor> {
-        self.0.forward(xs)
-    }
 }
 
 impl Module for RmsNorm {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        #[cfg(feature = "gcu")]
-        {
-            return self.0.forward(xs);
-        }
-        #[cfg(not(feature = "gcu"))]
-        {
-            if xs.is_contiguous() {
-                crate::ops::rms_norm(xs, &self.0.weight, self.0.eps as f32)
-            } else {
-                self.0.forward(xs)
-            }
-        }
+        let xs = if xs.is_contiguous() {
+            xs.clone()
+        } else {
+            xs.contiguous()?
+        };
+        crate::ops::rms_norm(&xs, &self.0.weight, self.0.eps as f32)
     }
 }
 

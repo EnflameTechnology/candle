@@ -856,15 +856,50 @@ impl candle::CustomOp2 for RmsNorm {
                 }};
             }
 
+            macro_rules! aten_rmsnorm_3d {
+                ($x:expr, $w:expr, $ty:ty, $variant:ident, $dtype_code:expr) => {{
+                    let out = dev.alloc::<$ty>(elem_count).w()?;
+                    let ret = unsafe {
+                        ubridge::ffi::topsaten_rms_norm_3d(
+                            out.device_ptr() as *mut std::ffi::c_void,
+                            $x.device_ptr() as *const std::ffi::c_void,
+                            $w.device_ptr() as *const std::ffi::c_void,
+                            batch as i32,
+                            chunks as i32,
+                            hidden_size,
+                            self.eps,
+                            $dtype_code,
+                            stream as *const std::ffi::c_void,
+                        )
+                    };
+                    if ret != 0 {
+                        candle::bail!("topsaten_rms_norm_3d failed with code {ret}");
+                    }
+                    GcuStorageSlice::$variant(out)
+                }};
+            }
+
             let slice = match (&s1.slice, &s2.slice) {
                 (GcuStorageSlice::BF16(x), GcuStorageSlice::BF16(w)) => {
-                    aten_rmsnorm!(x, w, bf16, BF16, 5i32)
+                    if dims.len() == 3 {
+                        aten_rmsnorm_3d!(x, w, bf16, BF16, 5i32)
+                    } else {
+                        aten_rmsnorm!(x, w, bf16, BF16, 5i32)
+                    }
                 }
                 (GcuStorageSlice::F16(x), GcuStorageSlice::F16(w)) => {
-                    aten_rmsnorm!(x, w, f16, F16, 4i32)
+                    if dims.len() == 3 {
+                        aten_rmsnorm_3d!(x, w, f16, F16, 4i32)
+                    } else {
+                        aten_rmsnorm!(x, w, f16, F16, 4i32)
+                    }
                 }
                 (GcuStorageSlice::F32(x), GcuStorageSlice::F32(w)) => {
-                    aten_rmsnorm!(x, w, f32, F32, 8i32)
+                    if dims.len() == 3 {
+                        aten_rmsnorm_3d!(x, w, f32, F32, 8i32)
+                    } else {
+                        aten_rmsnorm!(x, w, f32, F32, 8i32)
+                    }
                 }
                 _ => candle::bail!("unsupported dtype for rmsnorm on gcu"),
             };

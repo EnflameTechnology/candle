@@ -2032,6 +2032,60 @@ impl GcuStorage {
             GcuStorageSlice::F64(inp) => inp.slice(start_o..).device_ptr(),
         };
         let inp = &inp;
+
+        #[cfg(feature = "aten")]
+        {
+            use crate::gcu_backend::WrapErr;
+            use ubridge::device_ptr::DevicePtr;
+
+            let dtype_code = |dtype: DType| match dtype {
+                DType::F16 => 4,
+                DType::BF16 => 5,
+                DType::F32 => 8,
+                _ => -1,
+            };
+            let input_dtype_code = dtype_code(src.dtype());
+            let output_dtype_code = dtype_code(dtype);
+            if input_dtype_code >= 0 && output_dtype_code >= 0 {
+                let stream = dev
+                    .stream_inner()
+                    .expect("unable to obtain stream for aten cast");
+                macro_rules! aten_cast {
+                    ($ty:ty, $variant:ident) => {{
+                        let out = dev.alloc::<$ty>(el).w()?;
+                        let ret = unsafe {
+                            ubridge::ffi::topsaten_cast(
+                                out.device_ptr() as *mut std::ffi::c_void,
+                                *inp as *const std::ffi::c_void,
+                                el as i64,
+                                input_dtype_code,
+                                output_dtype_code,
+                                stream as *const std::ffi::c_void,
+                            )
+                        };
+                        if ret == 0 {
+                            return Ok(Self {
+                                slice: GcuStorageSlice::$variant(out),
+                                device: dev.clone(),
+                            });
+                        }
+                    }};
+                }
+                match dtype {
+                    DType::U8 => aten_cast!(u8, U8),
+                    DType::I8 => aten_cast!(i8, I8),
+                    DType::U32 => aten_cast!(u32, U32),
+                    DType::I32 => aten_cast!(i32, I32),
+                    DType::I64 => aten_cast!(i64, I64),
+                    DType::BF16 => aten_cast!(bf16, BF16),
+                    DType::F16 => aten_cast!(f16, F16),
+                    DType::F32 => aten_cast!(f32, F32),
+                    DType::F64 => aten_cast!(f64, F64),
+                    DType::F8E8M0 | DType::F8E4M3 => {}
+                }
+            }
+        }
+
         let kernel_name = format!("cast_{}_{}", src.dtype().as_str(), dtype.as_str());
         let mut cfg = dev.launch_cfg.clone();
         cfg.set_shared_memory(el as u32 * self.dtype().size_in_bytes() as u32);

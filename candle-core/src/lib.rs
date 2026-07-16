@@ -124,10 +124,10 @@ pub use cuda::{CudaDevice, CudaStorage};
 #[cfg(not(feature = "gcu"))]
 pub use dummy_gcu_backend::{GcuDevice, GcuStorage};
 
-#[cfg(feature = "gcu")]
-pub use gcu_backend::{cuda_param_cache_scope, GcuDevice, GcuStorage};
 #[cfg(all(feature = "gcu", feature = "graph"))]
 pub use gcu_backend::is_param_cache_enabled;
+#[cfg(feature = "gcu")]
+pub use gcu_backend::{cuda_param_cache_scope, GcuDevice, GcuStorage};
 
 #[cfg(feature = "metal")]
 pub use metal_backend::{MetalDevice, MetalError, MetalStorage};
