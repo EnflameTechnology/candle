@@ -1995,6 +1995,7 @@ macro_rules! Gcu_dtype {
     };
 }
 Gcu_dtype!(u8, U8);
+Gcu_dtype!(i8, I8);
 Gcu_dtype!(u32, U32);
 Gcu_dtype!(i32, I32);
 Gcu_dtype!(i64, I64);
@@ -2039,9 +2040,11 @@ impl GcuStorage {
             use ubridge::device_ptr::DevicePtr;
 
             let dtype_code = |dtype: DType| match dtype {
+                DType::I32 => 6,
                 DType::F16 => 4,
                 DType::BF16 => 5,
                 DType::F32 => 8,
+                DType::I64 => 11,
                 _ => -1,
             };
             let input_dtype_code = dtype_code(src.dtype());
